@@ -1,7 +1,7 @@
 // Runs in the authorized platform page. Uses that page's ordinary requests;
 // never exports cookies, bypasses verification, signs requests or searches names.
 (() => {
-  const VERSION=2;
+  const VERSION=4;
   if(globalThis.KOLMultiReader?.version===VERSION)return;
   const yt=globalThis.KOLYouTube;
   const text=v=>typeof v==='string'?v:v?.simpleText||v?.content||v?.runs?.map(r=>r.text).join('')||'';
@@ -24,7 +24,7 @@
     if(!body.trim())fail('empty_response','平台返回空内容，未确认读取范围。');
     return {body,url:response.url||target.href};
   }
-  async function json(url,options){const r=await request(url,options);try{return JSON.parse(r.body);}catch{fail('invalid_response','平台未返回有效的数据，请检查登录或验证。');}}
+  async function json(url,options){const r=await request(url,options);try{return JSON.parse(r.body.replace(/^for \(;;\);/,''));}catch{fail('invalid_response','平台未返回有效的数据，请检查登录或验证。');}}
   function assignment(html,name){
     const re=new RegExp(`(?:var\\s+${name}|window\\[['"]${name}['"]\\]|${name})\\s*=\\s*`,'g'),m=re.exec(html);if(!m)return null;
     const start=html.indexOf('{',re.lastIndex);if(start<0)return null;let level=0,q=false,esc=false;
@@ -99,7 +99,9 @@
     const timestamp=date?Date.parse(date):NaN;
     const description=String(v.shortDescription||entry.title||'');
     const thumbnailUrl=v.thumbnail?.thumbnails?.at(-1)?.url||`https://i.ytimg.com/vi/${entry.id}/hqdefault.jpg`;
-    return {id:entry.id,handle:job.handle,url:entry.url,description,hashtags:[...description.matchAll(/#([\p{L}\p{N}_]+)/gu)].map(m=>m[1]),thumbnailUrl,createdAt:Number.isFinite(timestamp)?timestamp:null,datePrecision:/T\d/.test(date||'')?'time':'day',views:count(v.viewCount),approxViews:false,pinned:false,kind:entry.kind,source:'native',observedAt:Date.now()};
+    // YouTube does not publish a per-video share count. Do not use likes or
+    // comment counts as substitutes for the required three-part interaction sum.
+    return {id:entry.id,handle:job.handle,url:entry.url,description,hashtags:[...description.matchAll(/#([\p{L}\p{N}_]+)/gu)].map(m=>m[1]),thumbnailUrl,createdAt:Number.isFinite(timestamp)?timestamp:null,datePrecision:/T\d/.test(date||'')?'time':'day',views:count(v.viewCount),likes:null,comments:null,shares:null,approxViews:false,pinned:false,kind:entry.kind,source:'native',observedAt:Date.now()};
   }
   async function mapConcurrent(items,fn,concurrency=3){
     const out=new Array(items.length);let i=0;await Promise.all(Array.from({length:Math.min(items.length,concurrency)},async()=>{while(i<items.length){const n=i++;out[n]=await fn(items[n]);}}));return out;
@@ -142,7 +144,7 @@
     const video=n.media_type===2||n.is_video===true||n.__typename==='GraphVideo';
     const timestamp=Number(n.taken_at||n.taken_at_timestamp);
     const thumbnailUrl=n.image_versions2?.candidates?.[0]?.url||n.display_url||n.thumbnail_src||'';
-    return {id,handle:job.handle,url:`https://www.instagram.com/${video?'reel':'p'}/${code}/`,description:caption,hashtags:[...caption.matchAll(/#([\p{L}\p{N}_]+)/gu)].map(m=>m[1]),thumbnailUrl,createdAt:timestamp>0?timestamp*1000:null,views:video?count(n.play_count??n.video_play_count??n.video_view_count??n.view_count):null,statEligible:video,approxViews:false,pinned:!!n.is_pinned||!!n.is_pinned_for_users?.length,source:'native',observedAt:Date.now()};
+    return {id,handle:job.handle,url:`https://www.instagram.com/${video?'reel':'p'}/${code}/`,description:caption,hashtags:[...caption.matchAll(/#([\p{L}\p{N}_]+)/gu)].map(m=>m[1]),thumbnailUrl,createdAt:timestamp>0?timestamp*1000:null,views:video?count(n.play_count??n.video_play_count??n.video_view_count??n.view_count):null,likes:count(n.like_count??n.edge_media_preview_like?.count),comments:count(n.comment_count??n.edge_media_to_comment?.count??n.edge_media_to_parent_comment?.count),shares:count(n.share_count??n.reshare_count),statEligible:video,approxViews:false,pinned:!!n.is_pinned||!!n.is_pinned_for_users?.length||!!n.timeline_pinned_user_ids?.length,source:'native',observedAt:Date.now()};
   }
   function embeddedIG(html){
     const doc=documentData(html),roots=[];
@@ -172,10 +174,44 @@
     const video=node.media_type===2||node.is_video===true||node.__typename==='GraphVideo';
     if(hasDate&&/^\d+$/.test(String(node.pk||node.id||''))&&(!video||count(node.play_count??node.video_play_count??node.video_view_count??node.view_count)!==null))return node;
     if(!/^[\w-]+$/.test(code||''))fail('invalid_response','Instagram 作品缺少有效短码，无法补充详情。');
+    const id=String(node.pk||node.id||'').split('_')[0];
+    if(/^\d+$/.test(id)){
+      const data=await json(`/api/v1/media/${id}/info/`,{headers:{'X-IG-App-ID':'936619743392459'}});
+      const detail=data.items?.find(n=>String(n.pk||n.id||'').split('_')[0]===id&&n.code===code);
+      if(!detail)fail('video_unavailable','Instagram 作品详情未返回对应作品，未采用其他视频的数据。');
+      return {...node,...detail};
+    }
     const response=await request(`/p/${code}/`),embedded=embeddedIG(response.body);
     const candidates=embedded.roots.flatMap(root=>visit(root,o=>(o.code===code||o.shortcode===code)&&(o.media_type||o.__typename==='GraphVideo'||o.__typename==='GraphImage')));
     if(!candidates.length)fail('video_unavailable','Instagram 作品详情未返回对应数据，保留已读取部分，请检查登录或验证。');
     return candidates.find(o=>Number(o.taken_at||o.taken_at_timestamp)>0)||candidates[0];
+  }
+  let igWebSession;
+  async function igQuery(docId,variables){
+    if(!igWebSession||Date.now()-igWebSession.at>60000){
+      const {body}=await request('/');const fields={};
+      // Same-origin anti-CSRF form fields are used only for the site's ordinary
+      // read request. Never return them, persist them or send them to the worker.
+      for(const [name,re]of [['fb_dtsg',/"DTSGInitialData",\[\],\{[^{}]*"token":"([^"]+)"/],['lsd',/"LSD",\[\],\{[^{}]*"token":"([^"]+)"/],['av',/"IG_USER_EIMU":"?(\d+)/]]){
+        const value=body.match(re)?.[1];if(value)fields[name]=value;
+      }
+      if(!fields.lsd)fail('login_required','Instagram 网页会话尚未就绪，请在官方页面完成登录或验证后重读。');
+      igWebSession={fields,at:Date.now()};
+    }
+    const headers={'Content-Type':'application/x-www-form-urlencoded','X-IG-App-ID':'936619743392459','X-FB-LSD':igWebSession.fields.lsd};
+    const csrf=document.cookie.match(/(?:^|;\s*)csrftoken=([^;]+)/)?.[1];if(csrf)headers['X-CSRFToken']=csrf;
+    const body=new URLSearchParams({...igWebSession.fields,__a:'1',__d:'www',doc_id:docId,variables:JSON.stringify(variables),server_timestamps:'true',fb_api_caller_class:'RelayModern'});
+    const data=await json('/api/graphql/',{method:'POST',headers,body:body.toString()});
+    if(data.errors?.length&&!data.data)fail('invalid_response','Instagram 网页查询未返回资料，可能需要登录、验证或接口适配。');
+    return data;
+  }
+  async function igTimeline(job,cursor){
+    const variables={data:{count:12,include_reel_media_seen_timestamp:true,include_relationship_info:true,latest_besties_reel_media:true,latest_reel_media:true},first:12,include_multi_captions:true,username:job.handle,__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider:true,__relay_internal__pv__PolarisShortDramaEnabledrelayprovider:true,__relay_internal__pv__PolarisSEOIsCrawlerrelayprovider:false,__relay_internal__pv__PolarisThreadsStyleCommentsEnabledrelayprovider:false,__relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider:false};
+    if(cursor)Object.assign(variables,{after:cursor,before:null,last:null});
+    const data=await igQuery('29104886249145907',variables);
+    const connection=data.data?.xdt_api__v1__feed__user_timeline_graphql_connection;
+    if(!Array.isArray(connection?.edges)||!connection.page_info)fail('invalid_response','Instagram 网页没有返回有效作品列表和分页状态，未将空响应当作完成。');
+    return connection;
   }
   async function instagram(job){
     let profile=job.profile,reader=job.reader||{},items,more,cursor;
@@ -188,7 +224,18 @@
       let user=users.length?Object.assign({},...users):null;
       const cached=cachedIG.get(job.handle.toLowerCase());
       if(!user&&cached&&Date.now()-cached.at<60000&&location.pathname.replace(/\/$/,'').toLowerCase()===`/${job.handle}`.toLowerCase())user=cached.user;
-      if(!user){const data=await json(`/api/v1/users/web_profile_info/?username=${encodeURIComponent(job.handle)}`,{headers});user=data.data?.user||data.user;
+      let sessionError;
+      if(!user)try{
+          const connection=await igTimeline(job);
+          const owner=connection.edges.map(e=>e.node?.user).find(u=>u?.username?.toLowerCase()===job.handle.toLowerCase());
+          const userId=String(owner?.pk||owner?.id||'');
+          if(/^\d+$/.test(userId)){
+            const data=await igQuery('27937681195819736',{id:userId,render_surface:'PROFILE',__relay_internal__pv__PolarisCannesGuardianExperienceEnabledrelayprovider:true,__relay_internal__pv__PolarisCASB976ProfileEnabledrelayprovider:false,__relay_internal__pv__PolarisRepostsConsumptionEnabledrelayprovider:false,__relay_internal__pv__PolarisWebSchoolsEnabledrelayprovider:false,enable_integrity_filters:true});
+            user=data.data?.user;
+            if(user){reader.pendingConnection=connection;reader.mode='web-timeline';}
+          }
+        }catch(error){if(error.kind!=='login_required')throw error;sessionError=error;}
+      if(!user){let data;try{data=await json(`/api/v1/users/web_profile_info/?username=${encodeURIComponent(job.handle)}`,{headers});}catch(error){if(sessionError&&error.kind==='api_unavailable')throw sessionError;throw error;}user=data.data?.user||data.user;
         if(!user){if(data.status==='ok'||data.message==='User not found')fail('not_found','Instagram 账号不存在或已更名。');fail('invalid_response','Instagram 没有返回主页资料。');}}
       if(user.username?.toLowerCase()!==job.handle.toLowerCase())fail('binding_mismatch','Instagram 主页与输入账号不一致。');
       const bio=user.biography||'',declared=globalThis.KOLPageData.declaredGender(bio);
@@ -203,16 +250,19 @@
         reader.pendingConnection=connection;reader.pageId=String(user.id||'');reader.mode=user.polaris_ordered_timeline_connection?'embedded-graphql':'legacy-feed';
       }
     }
-    if(reader.pendingConnection||reader.mode==='embedded-graphql'){
+    if(reader.pendingConnection||['embedded-graphql','web-timeline'].includes(reader.mode)){
       let connection=reader.pendingConnection;delete reader.pendingConnection;
       if(!connection){
-        if(!reader.pageId||!reader.cursor)fail('invalid_cursor','Instagram 页面分页缺少账号ID或游标。');
+        if(!reader.cursor)fail('invalid_cursor','Instagram 页面分页缺少游标。');
         // Public web query, verified against Instaloader 7acd1b6. No signature
         // generation, cookie extraction or retry around access controls.
-        const variables={id:reader.pageId,first:12,after:reader.cursor,__relay_internal__pv__PolarisSEOIsCrawlerrelayprovider:false};
-        const body=new URLSearchParams({doc_id:'28904005159232689',variables:JSON.stringify(variables)});
-        const data=await json('/api/graphql',{method:'POST',headers:{...headers,'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});
-        connection=data.data?.node?.polaris_ordered_timeline_connection;
+        if(reader.mode==='web-timeline')connection=await igTimeline(job,reader.cursor);
+        else{
+          if(!reader.pageId)fail('invalid_cursor','Instagram 页面分页缺少账号ID。');
+          const variables={id:reader.pageId,first:12,after:reader.cursor,__relay_internal__pv__PolarisSEOIsCrawlerrelayprovider:false};
+          const data=await igQuery('28904005159232689',variables);
+          connection=data.data?.node?.polaris_ordered_timeline_connection;
+        }
         if(!connection)fail('invalid_response','Instagram 网页分页结构变化或请求未获准，未把空响应当作末页。');
       }
       if(!Array.isArray(connection.edges))fail('invalid_response','Instagram 网页没有可识别的作品列表。');

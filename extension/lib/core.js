@@ -5,7 +5,7 @@ export const normalizeYouTube=globalThis.KOLYouTube.normalize;
 export const FIELDS = [
   ['url', 'TikTok 主页 URL'], ['contact', '联系方式'], ['handle', '博主 ID'],
   ['gender', '性别'], ['name', '博主名称'], ['followers', 'TikTok 粉丝量'],
-  ['median', '中位播放数'], ['average', '平均播放数'], ['tier', '量级'],
+  ['median', '中位播放数'], ['average', '平均播放数'], ['engagementRateMax', '互动率（Max）'], ['tier', '量级'],
   ['tiktokUrl','TikTok 主页 URL'], ['tiktokFollowers','TikTok 粉丝量'],
   ['instagramUrl','Instagram 主页 URL'], ['instagramFollowers', 'Instagram 粉丝量'],
   ['youtubeUrl','YouTube 频道 URL'], ['youtubeSubscribers', 'YouTube 订阅数'], ['types', '达人类型']
@@ -83,7 +83,7 @@ export function formatFollowers(value){
   if(rounded>=1000&&index<units.length-1){index++;rounded=Math.round((count/units[index].size+Number.EPSILON)*100)/100;}
   return `${rounded}${units[index].label}`;
 }
-export function fieldText(key,value){if(key==='gender'&&/^(未知|unknown)$/i.test(String(value??'').trim()))return '';return ['followers','tiktokFollowers','instagramFollowers','youtubeSubscribers'].includes(key)?formatFollowers(value):String(value??'');}
+export function fieldText(key,value){if(key==='gender'&&/^(未知|unknown)$/i.test(String(value??'').trim()))return '';if(key==='engagementRateMax')return Number.isFinite(value)&&value>=0?`${(value*100).toFixed(2)}%`:'';return ['followers','tiktokFollowers','instagramFollowers','youtubeSubscribers'].includes(key)?formatFollowers(value):String(value??'');}
 export function tier(followers) {
   if (followers === null || followers === undefined || followers === '') return '';
   const n = Number(followers);
@@ -121,6 +121,28 @@ export function statistics(videos, setting, now = Date.now()) {
   const mid = Math.floor(values.length/2);
   return {average: Math.round(values.reduce((a,b)=>a+b,0)/values.length), median: values.length%2 ? values[mid] : (values[mid-1]+values[mid])/2, count:samples.length, missing, unknownDates};
 }
+export function engagementRate(video){
+  if(video.approxViews||!Number.isFinite(video.views)||video.views<=0)return null;
+  const values=[video.likes,video.comments,video.shares];
+  if(values.some(v=>!Number.isFinite(v)||v<0)||video.approxInteractions)return null;
+  const rate=values.reduce((sum,v)=>sum+v,0)/video.views;
+  return Number.isFinite(rate)?rate:null;
+}
+export function engagementAudit(row,config,now=Date.now()){
+  const end=row.capturedAt||now,{samples}=sampleSelection(row.videos||[],config,end);
+  const stats=statistics(row.videos||[],config,end),rangeComplete=statsComplete(row,config,end)&&!stats.unknownDates;
+  const zeroViewCount=samples.filter(v=>v.views===0&&!v.approxViews).length,missingMetrics=new Set();let missingCount=0,winner=null;
+  for(const v of samples){
+    if(v.views===0&&!v.approxViews)continue;
+    const rate=engagementRate(v);
+    if(rate===null){missingCount++;for(const key of ['likes','comments','shares'])if(!Number.isFinite(v[key])||v[key]<0)missingMetrics.add(key);continue;}
+    if(!winner||rate>winner.rate)winner={id:v.id,url:v.url,rate,likes:v.likes,comments:v.comments,shares:v.shares,views:v.views};
+  }
+  const complete=rangeComplete&&missingCount===0,maximum=complete?winner?.rate??null:null;
+  const labels={likes:'点赞数',comments:'评论数',shares:'转发数'};
+  const note=!rangeComplete?'统计范围尚未确认，互动率暂不计算。':!samples.length?'统计范围内没有作品。':missingCount?`有 ${missingCount} 条作品缺少精确${missingMetrics.size?[...missingMetrics].map(k=>labels[k]).join('、'):'播放量或互动数'}，无法确认最大互动率。${row.platform==='youtube'?'YouTube 不公开单条视频转发数。':''}`:!winner?'范围内作品播放量均为 0，无法计算互动率。':`${statsLabel(config)}，${samples.length-zeroViewCount} 条有效样本，取单条互动率最大值${zeroViewCount?`；排除 ${zeroViewCount} 条零播放作品`:''}。`;
+  return {formula:'（点赞数＋评论数＋转发数）÷视频播放量 × 100%，取统计范围内单条视频最大值',maximum,winner:complete?winner:null,count:samples.length,validCount:samples.length-zeroViewCount-missingCount,missingCount,missingMetrics:[...missingMetrics],zeroViewCount,rangeComplete,complete,note};
+}
 export function statisticsAudit(row,config,now=Date.now()){
   const end=row.capturedAt||now,byCount=config.statsMode==='videos';
   const unique=[...new Map((row.videos||[]).map(v=>[v.id,v])).values()];
@@ -130,10 +152,10 @@ export function statisticsAudit(row,config,now=Date.now()){
     const inRange=selected.has(v.id);
     const exact=Number.isFinite(v.views)&&v.views>=0&&!v.approxViews;
     const reason=v.statEligible===false?'非视频作品，不计播放统计':!Number.isFinite(v.createdAt)?'发布时间缺失':v.createdAt>end?'晚于统计截止':!inRange?(byCount?'不在最近N条内':'早于统计范围'):!exact?'播放量缺失或为缩略值':'计入统计';
-    return {id:v.id,url:v.url,publishedAt:Number.isFinite(v.createdAt)?new Date(v.createdAt).toISOString():null,datePrecision:v.datePrecision||'time',views:v.views??null,pinned:!!v.pinned,included:inRange&&exact&&v.statEligible!==false,reason,source:v.source||'unknown',observedAt:v.observedAt?new Date(v.observedAt).toISOString():null};
+    return {id:v.id,url:v.url,publishedAt:Number.isFinite(v.createdAt)?new Date(v.createdAt).toISOString():null,datePrecision:v.datePrecision||'time',views:v.views??null,likes:v.likes??null,comments:v.comments??null,shares:v.shares??null,engagementRate:engagementRate(v),pinned:!!v.pinned,included:inRange&&exact&&v.statEligible!==false,reason,source:v.source||'unknown',observedAt:v.observedAt?new Date(v.observedAt).toISOString():null};
   }).sort((a,b)=>(b.publishedAt||'').localeCompare(a.publishedAt||'')||a.id.localeCompare(b.id));
   const stats=statistics(unique,config,end),included=posts.filter(p=>p.included),sum=included.reduce((n,p)=>n+p.views,0);
-  return {handle:row.handle,mode:byCount?'videos':'days',label:statsLabel(config),requestedCount:byCount?config.statsCount:null,days:byCount?null:config.statsDays,start:new Date(start).toISOString(),end:new Date(end).toISOString(),rangeComplete:statsComplete(row,config,end),count:stats.count,validCount:included.length,sum,average:stats.average,median:stats.median,missing:stats.missing,unknownDates:stats.unknownDates,formula:byCount?'同一视频ID去重；按发布时间倒序选最近N条（包含视频和图文）；置顶按实际时间排序；缺失播放数不以更旧视频补位':'同一视频 ID 去重；发布时间在起止时间内；按原始播放数计算；范围内置顶视频照常计入',posts};
+  return {handle:row.handle,mode:byCount?'videos':'days',label:statsLabel(config),requestedCount:byCount?config.statsCount:null,days:byCount?null:config.statsDays,start:new Date(start).toISOString(),end:new Date(end).toISOString(),rangeComplete:statsComplete(row,config,end),count:stats.count,validCount:included.length,sum,average:stats.average,median:stats.median,missing:stats.missing,unknownDates:stats.unknownDates,engagement:engagementAudit(row,config,end),formula:byCount?'同一视频ID去重；按发布时间倒序选最近N条（包含视频和图文）；置顶按实际时间排序；缺失播放数不以更旧视频补位':'同一视频 ID 去重；发布时间在起止时间内；按原始播放数计算；范围内置顶视频照常计入',posts};
 }
 // Creator categories are deliberately topic-only. Words such as tutorial,
 // challenge, POV and funny describe a video's format, so they cannot create a
@@ -148,7 +170,7 @@ const TYPE_RULES = [
   ['健身运动', ['fitness','workout','gym','bodybuilding','calisthenics','yoga','basketball','football','soccer','running','健身','运动','瑜伽']],
   ['旅行', ['travel','vacation','tourism','travelling','旅游','旅行']],
   ['宠物', ['pet','pets','puppy','kitten','dog','dogs','cat','cats','catsoftiktok','animal','宠物','猫咪','狗狗']],
-  ['音乐舞蹈', ['dance','dancing','singer','singing','musician','music','音乐','舞蹈','唱歌']],
+  ['音乐舞蹈', ['dance','dancing','singer','singing','musician','music','choreography','kpop','音乐','音樂','舞蹈','唱歌','歌手','专辑','專輯']],
   ['喜剧', ['comedy','comedian','sketch','prank','搞笑','喜剧']],
   ['教育知识', ['education','learning','science','history','math','study','knowledge','知识','教学','科普','学习']],
   ['生活方式', ['lifestyle','dailyvlog','daily','vlog','日常','生活记录']]
@@ -187,7 +209,7 @@ export function classify(videos=[], bio = '') {
   }).filter(x=>x.videoHits||x.bioHit).sort((a,b)=>b.score-a.score||b.videoHits-a.videoHits||b.coverage-a.coverage);
   if(!scored.length)return '';
   const qualifies=x=>count<=2?x.videoHits>=1:(x.videoHits>=3||x.coverage>=0.15);
-  const primary=count?scored.find(qualifies):scored.find(x=>x.bioHit);
+  const primary=(count?scored.find(qualifies):null)||scored.find(x=>x.bioHit);
   if(!primary)return '';
   const output=[primary.name];
   const secondary=scored.find(x=>x!==primary&&x.videoHits>=3&&x.coverage>=0.2&&x.score>=primary.score*0.35);
@@ -264,6 +286,7 @@ export function resultFor(row, config, now) {
   if(row.aiResult?.gender&&!p.gender&&!Object.hasOwn(row.overrides||{},'gender'))result.gender=row.aiResult.gender;
   if(Object.hasOwn(row.overrides||{},'followers')&&!Object.hasOwn(row.overrides||{},'tier'))result.tier=tier(result.followers);
   if(p.approxFollowers&&!Object.hasOwn(row.overrides||{},'followers'))result.followers='';
+  result.engagementRateMax=engagementAudit(row,config,now).maximum??'';
   return result;
 }
 export function mergeVideos(existing,incoming,handle){
@@ -283,7 +306,7 @@ export function tsvCell(value) {
   return /[\t\n\r"]/.test(s)?`"${s.replace(/"/g,'""')}"`:s;
 }
 export function toTSV(rows, columns, withHeaders=true) {
-  const lines=rows.map(row=>columns.map(col=>tsvCell(['followers','tiktokFollowers','instagramFollowers','youtubeSubscribers','gender'].includes(col.key)?fieldText(col.key,row[col.key]):row[col.key])).join('\t'));
+  const lines=rows.map(row=>columns.map(col=>tsvCell(['followers','tiktokFollowers','instagramFollowers','youtubeSubscribers','gender','engagementRateMax'].includes(col.key)?fieldText(col.key,row[col.key]):row[col.key])).join('\t'));
   if(withHeaders) lines.unshift(columns.map(col=>tsvCell(col.label)).join('\t'));
   return lines.join('\r\n');
 }

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "KOL 本地助手",
   "description": "批量整理 TikTok、Instagram、YouTube 达人资料、品牌关键词与表格输出，可选 AI 内容分类。",
-  "version": "0.2.1",
+  "version": "0.2.3",
   "minimum_chrome_version": "120",
   "permissions": [
     "storage",

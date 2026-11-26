@@ -1,4 +1,4 @@
-import {FIELDS,parseClipboard,normalizeProfile,normalizeInstagram,normalizeYouTube,parseCount,toTSV,keywords,matchBrands,rangeComplete,statisticsAudit,statsLabel,statsComplete,fieldText} from './lib/core.js';
+import {FIELDS,parseClipboard,normalizeProfile,normalizeInstagram,normalizeYouTube,parseCount,toTSV,keywords,matchBrands,rangeComplete,statisticsAudit,engagementAudit,statsLabel,statsComplete,fieldText} from './lib/core.js';
 import {brandState} from './lib/presentation.js';
 import {setupVersionUpdates} from './version-ui.js';
 import {PLATFORMS,sourcePlatform,normalizeCreator,creatorKey,fieldsFor,selectColumns} from './lib/platforms.js';
@@ -118,7 +118,7 @@ function render(){
   $('run-label').textContent=readonly?`已保存 · ${complete}/${total} 已完成`:running?`${state.run.phase==='recovering'?'正在恢复页面连接':'正在读取'} · ${complete}/${total} 已完成`:state.run.status==='finished'?`处理结束 · ${complete}/${total} 已完成`:state.run.status==='blocked'?'读取已暂停，请查看原因':state.run.status==='paused'?'已暂停，进度已保存':'等待开始';
   renderRangeHint();
   $('empty').hidden=!!total;$('table-wrap').hidden=!total;
-  renderSourceTabs();$('ai-entry-text').textContent=state.ai?.enabled?'AI 已开启':'AI 辅助';
+  renderSourceTabs();$('ai-entry-text').textContent=state.ai?.enabled?(state.ai.verified?'AI 已连接':'AI 待测试'):'AI 辅助';
   const tt=state.connections[primary()],good=['public','connected'].includes(tt.kind);
   $('connection-label').textContent=good?connectionNames[tt.kind]:'连接管理';
   $('connection-dot').className=`dot ${good?'good':tt.kind==='not_granted'?'':'warn'}`;
@@ -204,13 +204,14 @@ function renderStatus(){
 }
 function renderTable(){
   const shown=resultState(),columns=outputColumns(shown),head=node('tr');
-  for(const c of columns)head.append(node('th',c.label));
+  for(const c of columns){const th=node('th',c.label);if(c.key==='engagementRateMax')th.title='（点赞数＋评论数＋转发数）÷播放量 × 100%，取当前统计范围内单条最大值';head.append(th);}
   head.append(node('th','品牌关键词','meta-col brand-meta'),node('th','读取状态','meta-col read-meta'));$('table-head').replaceChildren(head);
   const fragment=document.createDocumentFragment();
   for(const row of shown.rows){
     const tr=node('tr');tr.dataset.rowId=row.id;tr.classList.toggle('row-reading',row.status==='running');tr.tabIndex=0;tr.setAttribute('aria-label',`查看 @${row.handle} 的资料`);
     for(const c of columns){const value=row.result?.[c.key]??'',td=node('td');td.title=String(value);
-      if(['followers','median','average','tiktokFollowers','instagramFollowers','youtubeSubscribers'].includes(c.key))td.classList.add('numeric');
+      if(['followers','median','average','engagementRateMax','tiktokFollowers','instagramFollowers','youtubeSubscribers'].includes(c.key))td.classList.add('numeric');
+      if(c.key==='engagementRateMax'){const audit=engagementAudit(row,shown.config);td.title=`${audit.formula}。${audit.note}`;}
       if(c.key==='youtubeSubscribers'&&row.youtubeApproximate&&!Object.hasOwn(row.overrides||{},c.key))td.title=`YouTube 页面公开值：${row.youtubeDisplay||fieldText(c.key,value)}（缩略精度）`;
       if(['median','average'].includes(c.key))td.title=`${statsLabel(shown.config)}；${row.preview?.count||0} 条样本`;
       if(c.key==='url'||c.key.endsWith('Url')){const a=node('a',value);a.href=value||'#';a.target='_blank';a.rel='noopener noreferrer';a.addEventListener('click',e=>e.stopPropagation());td.append(a);}
@@ -278,7 +279,7 @@ function finishColumnDrag(commit){
 }
 function openRow(id){
   const shown=resultState(),row=shown.rows.find(r=>r.id===id);if(!row)return;editingId=id;editOriginal={...row.result};$('row-title').textContent=`@${row.handle}`;renderAIStatus(row);$('row-status').textContent=rowDisplayStatus(row);$('row-notice').textContent=row.note;$('row-instagram').value=row.instagram||'';$('row-youtube').value=row.youtube||'';
-  $('row-fields').replaceChildren();for(const field of activeFields()){const wrap=node('div'),label=node('label',field.label),input=node(field.key==='brandLinks'?'textarea':'input');input.id=`edit-${field.key}`;input.value=field.key==='gender'?fieldText('gender',row.result?.gender):String(row.result?.[field.key]??'');input.readOnly=!!historyView;if(field.key==='gender')input.title=row.profile.genderEvidence?`本人公开自述：${row.profile.genderEvidence}`:'未读取到明确的本人声明，可人工填写。';label.htmlFor=input.id;if(['median','average','followers','instagramFollowers','youtubeSubscribers'].includes(field.key))input.inputMode='decimal';wrap.append(label,input);$('row-fields').append(wrap);}
+  $('row-fields').replaceChildren();for(const field of activeFields()){const wrap=node('div'),label=node('label',field.label),input=node(field.key==='brandLinks'?'textarea':'input');input.id=`edit-${field.key}`;input.value=['gender','engagementRateMax'].includes(field.key)?fieldText(field.key,row.result?.[field.key]):String(row.result?.[field.key]??'');input.readOnly=!!historyView||field.key==='engagementRateMax';if(field.key==='gender')input.title=row.profile.genderEvidence?`本人公开自述：${row.profile.genderEvidence}`:'未读取到明确的本人声明，可人工填写。';label.htmlFor=input.id;if(['median','average','followers','instagramFollowers','youtubeSubscribers'].includes(field.key))input.inputMode='decimal';wrap.append(label,input);if(field.key==='engagementRateMax'){const audit=engagementAudit(row,shown.config);wrap.append(node('p',`${audit.formula}。${audit.note}`,'enrichment-status'));}$('row-fields').append(wrap);}
   for(const name of ['retry-row','save-row','read-instagram','read-youtube'])$(name).hidden=!!historyView;$('row-instagram').readOnly=!!historyView;$('row-youtube').readOnly=!!historyView;
   $('retry-row').disabled=state.run.status==='running';renderInstagramStatus(row);renderYouTubeStatus(row);renderAIStatus(row);renderAudit(row);renderLinks(row);showDialog('row-dialog');
 }
@@ -344,7 +345,7 @@ for(const item of document.querySelectorAll('[data-platform]'))item.querySelecto
 window.addEventListener('focus',queueConnectionCheck);
 document.addEventListener('visibilitychange',queueConnectionCheck);
 chrome.tabs.onActivated.addListener(({tabId})=>{chrome.tabs.getCurrent().then(tab=>{if(tab?.id===tabId)queueConnectionCheck();}).catch(()=>{});});
-action($('save-row'),async()=>{await send('SET_YOUTUBE',{id:editingId,value:$('row-youtube').value});for(const f of activeFields()){const value=$(`edit-${f.key}`).value;if(value!==String(editOriginal[f.key]??''))await send('EDIT',{id:editingId,key:f.key,value});}await send('SET_INSTAGRAM',{id:editingId,value:$('row-instagram').value});$('row-dialog').close();toast('修改已保存。');});
+action($('save-row'),async()=>{await send('SET_YOUTUBE',{id:editingId,value:$('row-youtube').value});for(const f of activeFields()){if(f.key==='engagementRateMax')continue;const value=$(`edit-${f.key}`).value;if(value!==String(editOriginal[f.key]??''))await send('EDIT',{id:editingId,key:f.key,value});}await send('SET_INSTAGRAM',{id:editingId,value:$('row-instagram').value});$('row-dialog').close();toast('修改已保存。');});
 action($('retry-row'),async()=>{const id=editingId;$('row-dialog').close();historyView=null;showPage('results');await send('RETRY',{id});});
 action($('read-instagram'),async()=>{await send('SET_INSTAGRAM',{id:editingId,value:$('row-instagram').value});if(state.connections.instagram.kind==='not_granted'){showDialog('connection-dialog');toast('先允许访问 Instagram，再返回达人详情读取。');return;}await send('READ_INSTAGRAM',{id:editingId});toast('Instagram粉丝量正在后台读取。');});
 action($('read-youtube'),async()=>{await send('SET_YOUTUBE',{id:editingId,value:$('row-youtube').value});if(state.connections.youtube.kind==='not_granted'){showDialog('connection-dialog');toast('先允许访问 YouTube，再返回达人详情读取。');return;}await send('READ_YOUTUBE',{id:editingId});toast('YouTube 订阅数正在后台读取。');});
@@ -403,7 +404,7 @@ async function saveAI(test=false){
     }
     const key=$('ai-clear-key').checked?'':$('ai-key').value||undefined;
     await send('AI_SAVE',{config,...(key===undefined?{}:{key})});$('ai-key').value='';
-    if(test){feedback.textContent='正在用测试文本检查接口与模型…';await rawMessage('AI_TEST');feedback.textContent='连接成功，接口与模型可用。';}
+    if(test){feedback.textContent=config.useImages?'正在依次测试文字连接与图片输入…':'正在测试文字连接…';const result=await rawMessage('AI_TEST');feedback.textContent=result.images?'文字连接、图片输入均已通过。':'文字连接已通过。';}
     else{$('ai-dialog').close();toast(config.enabled?'AI 辅助已开启，基础数据完成后自动分析。':'AI 设置已保存，继续使用本地规则。');}
   }catch(error){feedback.classList.add('error');feedback.textContent=error.message;}
 }

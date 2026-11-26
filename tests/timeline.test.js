@@ -52,7 +52,7 @@ test('30天统计可在180天品牌检索进行时导出；扩大天数需更多
     {...item(3,90),views:9000000,description:'Apple',tags:[],url:'https://www.tiktok.com/@tester/video/3'}];
   const row={handle:'tester',capturedAt:now,profile:{},videos,exhausted:false,paging:{timeline:proof([['0',page([item(4,31),item(5,32)])]])}};
   const r=resultFor(row,{statsDays:30,brands:'apple'},now);
-  assert.equal(r.average,200);assert.equal(r.median,200);assert.equal(r.brandLinks,'');assert.equal(Object.keys(r).length,17);
+  assert.equal(r.average,200);assert.equal(r.median,200);assert.equal(r.brandLinks,'');assert.equal(Object.keys(r).length,18);
   assert.equal(resultFor(row,{statsDays:180,brands:'apple'},now).average,'');
   row.paging.timeline=proof([['0',page([item(4,181),item(5,182)])]]);
   assert.equal(resultFor(row,{statsDays:30,brands:'apple'},now).brandLinks.match(/https:/g).length,3);

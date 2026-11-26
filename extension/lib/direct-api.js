@@ -1,7 +1,7 @@
 // Public creator-list requests in the platform's own browser context. No
 // third-party signer, cookie API, copied signature or user-page scrolling.
 (() => {
-  const revision='0.1.19';
+  const revision='0.2.3';
   if(globalThis.KOLDirectAPI?.revision===revision)return;
   const parser=globalThis.KOLPageData;
   let template='';const profiles=new Map(),deviceWords=crypto.getRandomValues(new Uint32Array(2));

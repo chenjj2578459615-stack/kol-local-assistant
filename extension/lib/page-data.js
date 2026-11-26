@@ -43,7 +43,7 @@
     const hashtags=[...new Set(hashtagValues.filter(Boolean).map(String))];
     const description=descriptionValues.join(' ').trim();
     const thumbnailUrl=item.video?.cover||item.video?.originCover||item.imagePost?.images?.[0]?.imageURL?.urlList?.[0]||'';
-    return {id,handle:String(author),url:`https://www.tiktok.com/@${author}/${item.imagePost?'photo':'video'}/${id}`,description,hashtags,tags:hashtags,thumbnailUrl,createdAt,views:count(item.stats?.playCount??item.statsV2?.playCount??item.statistics?.play_count),approxViews:false,pinned:flag(item.isPinnedItem)===true};
+    return {id,handle:String(author),url:`https://www.tiktok.com/@${author}/${item.imagePost?'photo':'video'}/${id}`,description,hashtags,tags:hashtags,thumbnailUrl,createdAt,views:count(item.stats?.playCount??item.statsV2?.playCount??item.statistics?.play_count),likes:count(item.stats?.diggCount??item.statsV2?.diggCount??item.statistics?.digg_count),comments:count(item.stats?.commentCount??item.statsV2?.commentCount??item.statistics?.comment_count),shares:count(item.stats?.shareCount??item.statsV2?.shareCount??item.statistics?.share_count),approxViews:false,pinned:flag(item.isPinnedItem)===true};
   }
   function extract(payload) {
     const profiles=[],videos=[];let listing=null;

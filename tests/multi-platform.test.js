@@ -11,7 +11,7 @@ test('三平台仅接受主页，跨平台仅采用明确链接；无名称猜�
  assert.equal(normalizeCreator('https://instagram.com/creator/','instagram').handle,'creator');
  assert.deepEqual(discoverAccounts({name:'MrBeast',links:[]}),{});
  assert.deepEqual(discoverAccounts({links:['https://www.youtube.com/redirect?q=https%3A%2F%2Fwww.tiktok.com%2F%40creator','https://www.instagram.com/creator/']}),{tiktok:'https://www.tiktok.com/@creator',instagram:'https://www.instagram.com/creator/'});
- for(const platform of ['tiktok','instagram','youtube']){const fields=fieldsFor(FIELDS,platform);assert.equal(fields.length,14);assert.equal(fields[0].label.startsWith({tiktok:'TikTok',instagram:'Instagram',youtube:'YouTube'}[platform]),true);}
+ for(const platform of ['tiktok','instagram','youtube']){const fields=fieldsFor(FIELDS,platform);assert.equal(fields.length,15);assert.equal(fields[0].label.startsWith({tiktok:'TikTok',instagram:'Instagram',youtube:'YouTube'}[platform]),true);}
 });
 test('YouTube 必须同时证明普通视频和Shorts范围；另一轨未完成不能提前导出',()=>{
  const row={platform:'youtube',handle:'creator',capturedAt:now,profile:{name:'Creator',followers:1000},videos:[],overrides:{}};

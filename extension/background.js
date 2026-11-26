@@ -1,8 +1,8 @@
-import {FIELDS, resultFor, normalizeInstagram, normalizeYouTube, normalizeProfile, statistics, mergeVideos, keywords, collectionDays, rangeComplete, statsComplete, collectionComplete, statsLabel, normalizeStatsConfig} from './lib/core.js';
+import {FIELDS, resultFor, engagementAudit, normalizeInstagram, normalizeYouTube, normalizeProfile, statistics, mergeVideos, keywords, collectionDays, rangeComplete, statsComplete, collectionComplete, statsLabel, normalizeStatsConfig} from './lib/core.js';
 import {batchKey,batchPersistence} from './lib/batches.js';
 import {sourcePlatform,normalizeCreator,creatorKey,discoverAccounts,fieldsFor} from './lib/platforms.js';
 import {mergePlatformVideos,updatePlatformCoverage} from './lib/multi-state.js';
-import {validateAIConfig,aiEvidence,requestAI,prepareAIImages} from './lib/ai.js';
+import {validateAIConfig,validateAIKey,aiEvidence,requestAI,prepareAIImages} from './lib/ai.js';
 import './lib/page-data.js';
 import {UpdateController} from './lib/update-controller.js';
 import {CHECK_INTERVAL} from './lib/github-updates.js';
@@ -26,12 +26,12 @@ const ready=(async()=>{
   state.connections.youtube??={kind:'not_granted',message:'需要读取 YouTube 订阅数时再连接。'};
   const knownColumns=new Set(FIELDS.map(f=>f.key)),seenColumns=new Set();
   state.columns=(state.columns||[]).filter(c=>knownColumns.has(c.key)&&!seenColumns.has(c.key)&&seenColumns.add(c.key));
-  for(const f of FIELDS)if(!seenColumns.has(f.key)){const after=state.columns.findIndex(c=>c.key==='instagramFollowers');state.columns.splice(f.key==='youtubeSubscribers'&&after>=0?after+1:state.columns.length,0,{...f,visible:true});}
+  for(const f of FIELDS)if(!seenColumns.has(f.key)){const anchor=f.key==='engagementRateMax'?'average':f.key==='youtubeSubscribers'?'instagramFollowers':null,after=state.columns.findIndex(c=>c.key===anchor);state.columns.splice(anchor&&after>=0?after+1:state.columns.length,0,{...f,visible:true});}
   if(!state.columns.some(c=>c.visible))state.columns[0].visible=true;
   state.instagramQueue??=[];
   state.youtubeQueue??=[];
   state.ai??={enabled:false};state.aiQueue??=[];
-  for(const row of state.rows)row.platform??='tiktok';
+  for(const row of state.rows){row.platform??='tiktok';row.result??={};row.result.engagementRateMax=engagementAudit(row,state.config,row.capturedAt).maximum??'';}
   // Repair only the old IG-only incomplete state when TikTok itself is complete.
   for(const row of state.rows){
     const stats=statistics(row.videos||[],state.config,row.capturedAt||Date.now());
@@ -355,7 +355,12 @@ async function start(){
 }
 async function finish(row,complete,note){
   await stopCollector();
-  if(complete){const stats=statistics(row.videos,state.config,row.capturedAt||Date.now());row.outcome={kind:stats.count?'complete':'empty_range',at:Date.now()};note+=stats.count?` 实际计入 ${stats.count} 条${state.config.statsMode==='videos'&&stats.count<state.config.statsCount?'（公开作品不足设定条数）':''}。`:` ${statsLabel(state.config)}内没有公开视频，播放统计不适用。`;}
+  if(complete){
+    const stats=statistics(row.videos,state.config,row.capturedAt||Date.now());
+    const latestVideoAt=Math.max(0,...row.videos.filter(v=>v.statEligible!==false&&Number.isFinite(v.createdAt)&&v.createdAt<=(row.capturedAt||Date.now())).map(v=>v.createdAt));
+    row.outcome={kind:stats.count?'complete':'empty_range',at:Date.now(),latestVideoAt:latestVideoAt||null};
+    note+=stats.count?` 实际计入 ${stats.count} 条${state.config.statsMode==='videos'&&stats.count<state.config.statsCount?'（公开作品不足设定条数）':''}。`:` ${statsLabel(state.config)}内没有公开视频，播放统计不适用。${latestVideoAt?`最近读取到的公开视频发布于 ${new Date(latestVideoAt).toLocaleDateString('zh-CN')}。`:''}`;
+  }
   row.result=resultFor(row,state.config,state.run.now);
   row.status=complete?'complete':'partial';row.note=note;
   state.run.index=null;state.run.token=null;
@@ -743,10 +748,11 @@ async function dispatch(m,sender){
     }
     case 'AI_SAVE':{
       const previous=(await chrome.storage.local.get(AI_STORE))[AI_STORE]||{},config=validateAIConfig(m.config);
-      const key=m.key===undefined?(previous.endpoint===config.endpoint?previous.key||'':''):String(m.key).trim();
+      const key=validateAIKey(m.key===undefined?(previous.endpoint===config.endpoint?previous.key||'':''):m.key,{required:config.enabled});
+      const verified=!!previous.verified&&['endpoint','model','useImages'].every(k=>previous[k]===config[k])&&key===previous.key;
       if(config.endpoint&&!await chrome.permissions.contains({origins:[new URL(config.endpoint).origin+'/*']}))throw new Error('尚未允许访问此 AI 接口，请重新保存并完成浏览器授权。');
-      await chrome.storage.local.set({[AI_STORE]:{...config,key}});
-      state.ai={enabled:config.enabled,configured:!!config.endpoint,revision:crypto.randomUUID()};state.aiQueue=[];
+      await chrome.storage.local.set({[AI_STORE]:{...config,key,verified}});
+      state.ai={enabled:config.enabled,configured:!!config.endpoint,verified,revision:crypto.randomUUID()};state.aiQueue=[];
       for(const row of state.rows){
         if(!config.enabled&&['queued','reading'].includes(row.aiStatus?.status))row.aiStatus={status:'stopped',note:'AI 已关闭，保留已有结果。'};
         else if(config.enabled&&['complete','partial'].includes(row.status))queueAI(row);
@@ -797,6 +803,7 @@ async function dispatch(m,sender){
     case 'EDIT':{
       const row=state.rows.find(r=>r.id===m.id);if(!row)throw new Error('未找到达人。');
       if(!FIELDS.some(x=>x.key===m.key))throw new Error('未知字段。');
+      if(m.key==='engagementRateMax')throw new Error('互动率（Max）由原始作品数据计算，请重新读取更新。');
       if(m.key==='url'||m.key.endsWith('Url')){
         const platform=m.key==='url'?row.platform||primary():({tiktokUrl:'tiktok',instagramUrl:'instagram',youtubeUrl:'youtube'})[m.key];
         const value=String(m.value??'').trim(),p=value?normalizeCreator(value,platform):null;
@@ -892,10 +899,20 @@ chrome.runtime.onMessage.addListener((m,sender,respond)=>{
       await ready;if(!sender.url?.startsWith(chrome.runtime.getURL('')))throw new Error('不接受网页发起的设置操作。');
       const settings=(await chrome.storage.local.get(AI_STORE))[AI_STORE];
       if(!settings?.endpoint||!settings.model)throw new Error('请先保存接口地址和模型。');
+      validateAIKey(settings.key);
       if(!await chrome.permissions.contains({origins:[new URL(settings.endpoint).origin+'/*']}))throw new Error('AI 接口尚未授权。');
-      const testImage='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6cUgAAAAASUVORK5CYII=';
-      await requestAI(settings,settings.key,{bio:'',videos:[{id:'connection-test',text:'数码产品评测',hashtags:['tech']}]},{signal:AbortSignal.timeout(25000),images:settings.useImages?[{id:'connection-test',dataUrl:testImage}]:[]});
-      return {connected:true};
+      const probeCanvas=new OffscreenCanvas(64,64),probeContext=probeCanvas.getContext('2d');
+      probeContext.fillStyle='#f5f5f7';probeContext.fillRect(0,0,64,64);probeContext.fillStyle='#232323';probeContext.fillRect(16,16,32,32);
+      const probeBlob=await probeCanvas.convertToBlob({type:'image/png'}),probeBytes=new Uint8Array(await probeBlob.arrayBuffer());
+      const testImage=`data:image/png;base64,${btoa(String.fromCharCode(...probeBytes))}`;
+      const evidence={bio:'',videos:[{id:'connection-test',text:'数码产品评测',hashtags:['tech']}]};
+      await requestAI(settings,settings.key,evidence,{signal:AbortSignal.timeout(25000)});
+      if(settings.useImages)try{await requestAI(settings,settings.key,evidence,{signal:AbortSignal.timeout(25000),images:[{id:'connection-test',dataUrl:testImage}]});}catch(error){throw new Error(`文字连接已通过；图片测试失败：${error.message}`);}
+      await serialize(async()=>{
+        const current=(await chrome.storage.local.get(AI_STORE))[AI_STORE];
+        if(current&&['endpoint','model','key','useImages'].every(k=>current[k]===settings[k])){await chrome.storage.local.set({[AI_STORE]:{...current,verified:true}});state.ai.verified=true;await save();}
+      });
+      return {connected:true,images:!!settings.useImages};
     })().then(data=>respond({ok:true,data}),error=>respond({ok:false,error:error.name==='TimeoutError'?'AI 请求超时，请检查接口与模型。':error.message}));return true;
   }
   serialize(()=>dispatch(m,sender)).then(data=>respond({ok:true,data}),error=>respond({ok:false,error:error.message}));return true;

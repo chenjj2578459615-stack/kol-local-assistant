@@ -16,7 +16,7 @@
     const hashtags=old.hashtags||incoming.hashtags
       ? [...(old.hashtags||[]),...(incoming.hashtags||[])]
       : [...(old.tags||[]),...(incoming.tags||[])];
-    return {...weak,...strong,description:strong.description||weak.description||'',hashtags:[...new Set(hashtags)],tags:[...new Set(tags)],createdAt:strong.createdAt??weak.createdAt??null,views:strong.views??weak.views??null,approxViews:strong.approxViews??false};
+    return {...weak,...strong,description:strong.description||weak.description||'',hashtags:[...new Set(hashtags)],tags:[...new Set(tags)],createdAt:strong.createdAt??weak.createdAt??null,views:strong.views??weak.views??null,likes:strong.likes??weak.likes??null,comments:strong.comments??weak.comments??null,shares:strong.shares??weak.shares??null,approxViews:strong.approxViews??false};
   }
   globalThis.KOLVideoData={merge};
 })();

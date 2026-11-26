@@ -63,7 +63,11 @@ await f.ctx.route('https://model.example.test/**',async r=>{
  if(aiFail){await r.fulfill({status:503,json:{error:'fixture down'}});return;}
  assert.equal(r.request().headers().authorization,'Bearer fixture-test-key');
  const content=r.request().postDataJSON().messages[1].content;
- if(Array.isArray(content)){const images=content.filter(c=>c.type==='image_url');assert.ok(images.length>0);assert.ok(images.every(im=>/^data:image\/(jpeg|png);base64,/.test(im.image_url.url)));imageRequests++;}
+ if(Array.isArray(content)){
+  const images=content.filter(c=>c.type==='image_url');assert.ok(images.length>0);assert.ok(images.every(im=>/^data:image\/(jpeg|png);base64,/.test(im.image_url.url)));
+  for(const image of images)assert.equal(await f.app.evaluate(async url=>{const bitmap=await createImageBitmap(await(await fetch(url)).blob());const valid=bitmap.width>0&&bitmap.height>0;bitmap.close();return valid;},image.image_url.url),true);
+  imageRequests++;
+ }
  const input=JSON.parse(Array.isArray(content)?content[0].text:content);
  assert.equal(JSON.stringify(input).includes('private-contact'),false);
  await r.fulfill({json:{choices:[{message:{content:JSON.stringify({types:[{label:'健身运动',videoIds:input.videos.map(v=>v.id)}],gender:'男',genderQuote:'I am a man'})}}]}});

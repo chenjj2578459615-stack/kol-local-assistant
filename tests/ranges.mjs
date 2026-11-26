@@ -45,12 +45,12 @@ try{
   await f.app.evaluate(()=>{navigator.clipboard.writeText=async value=>{globalThis.copiedTSV=value;};});
   f.app.once('dialog',dialog=>dialog.accept());await f.app.locator('#copy').click();
   await f.app.waitForFunction(()=>globalThis.copiedTSV);const copied=parseClipboard(await f.app.evaluate(()=>globalThis.copiedTSV));
-  assert.equal(copied[1][6],'115.5');assert.equal(copied[1][7],'116');assert.equal(copied[1].length,14);
+  assert.equal(copied[1][6],'115.5');assert.equal(copied[1][7],'116');assert.equal(copied[1].length,15);
   await f.app.screenshot({path:path.join(f.out,'01-30天统计已完成-品牌继续检索.png')});
   const brandBefore={status:row.status,average:row.result.average,median:row.result.median,brandLinks:row.result.brandLinks};
   releaseBrand();s=await f.wait(s=>s.run.status==='finished',30000);row=s.rows[0];
   assert.equal(row.status,'complete');assert.equal(row.exhausted,false);assert.equal(row.videos.length,192);assert.equal(row.result.average,originalAverage);assert.equal(row.preview.count,30);
-  assert.equal(row.result.brandLinks.match(/https:/g).length,180);assert.equal(requests.filter(r=>r.h==='withbrand').length,8);assert.equal(Object.keys(row.result).length,17);
+  assert.equal(row.result.brandLinks.match(/https:/g).length,180);assert.equal(requests.filter(r=>r.h==='withbrand').length,8);assert.equal(Object.keys(row.result).length,18);
   results.push({case:'30-day statistics final while 180-day brand search continues; old videos never enter statistics',beforeBrandComplete:brandBefore,postsRead:192,statisticsSamples:30,brandVideoCount:180,fullHistoryExhausted:false});
   await f.app.locator('#clear').click();await f.app.locator('#brands').fill('');await f.app.locator('#stats-days').fill('30');
   assert.equal(await f.app.locator('#stats-days').inputValue(),'30');await f.app.screenshot({path:path.join(f.out,'02-无品牌词仅统计30天.png')});

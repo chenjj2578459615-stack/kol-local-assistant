@@ -36,7 +36,7 @@ try{
   let s=await f.wait(s=>s.rows[0]?.videos.length>=24&&s.run.mode==='page'),first=Date.now()-started;
   assert.equal(s.run.owned,true);assert.notEqual(s.run.tabId,(await f.worker.evaluate(async url=>(await chrome.tabs.query({})).find(t=>t.url===url&&!t.active)?.id,original.url())));
   s=await f.wait(s=>s.run.status==='finished',60000);
-  assert.equal(s.rows[0].videos.length,241);assert.equal(s.rows[0].status,'complete');assert.equal(s.rows[0].result.average,220);assert.equal(s.rows[0].result.median,220);assert.equal(s.rows[0].result.brandLinks.match(/https:/g).length,241);assert.equal(Object.keys(s.rows[0].result).length,17);
+  assert.equal(s.rows[0].videos.length,241);assert.equal(s.rows[0].status,'complete');assert.equal(s.rows[0].result.average,220);assert.equal(s.rows[0].result.median,220);assert.equal(s.rows[0].result.brandLinks.match(/https:/g).length,241);assert.equal(Object.keys(s.rows[0].result).length,18);
   assert.equal(await original.evaluate(()=>document.getElementById('feed').scrollTop),before.scroll);
   assert.ok(requests.every(r=>r.native));assert.equal(navigation.get('fast'),2);
   const own=await f.worker.evaluate(id=>chrome.tabs.get(id),s.run.tabId),appWindow=await f.app.evaluate(()=>chrome.tabs.getCurrent().then(t=>t.windowId));

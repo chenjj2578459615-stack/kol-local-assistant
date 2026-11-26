@@ -21,7 +21,7 @@ try{
  const archivedId='legacy-archived-fixture',archived={schema:1,id:archivedId,createdAt:now-86400000,savedAt:now-86400000,rows:structuredClone(s.rows),columns:structuredClone(s.columns),config:structuredClone(s.config),draft:{},run:{status:'finished',now},notice:''};
  s.history.push({id:archivedId,createdAt:archived.createdAt,updatedAt:archived.savedAt,count:2,complete:0,status:'finished',statsDays:30,brands:'Apple',handles:['legacy','failed']});
  const expectedColumns=s.columns.filter(c=>FIELDS.some(f=>f.key===c.key));
- for(const field of FIELDS)if(!expectedColumns.some(c=>c.key===field.key)){const after=expectedColumns.findIndex(c=>c.key==='instagramFollowers');expectedColumns.splice(field.key==='youtubeSubscribers'&&after>=0?after+1:expectedColumns.length,0,{...field,visible:true});}
+ for(const field of FIELDS)if(!expectedColumns.some(c=>c.key===field.key)){const anchor=field.key==='engagementRateMax'?'average':field.key==='youtubeSubscribers'?'instagramFollowers':null,after=expectedColumns.findIndex(c=>c.key===anchor);expectedColumns.splice(anchor&&after>=0?after+1:expectedColumns.length,0,{...field,visible:true});}
  const workerControl=await ctx.newCDPSession(app),versions=[];workerControl.on('ServiceWorker.workerVersionUpdated',e=>versions.push(...e.versions));await workerControl.send('ServiceWorker.enable');
  const end=Date.now()+5000;while(!versions.some(v=>v.scriptURL.endsWith('/runtime/0.1.17/background.js'))&&Date.now()<end)await app.waitForTimeout(50);
  const workerVersion=versions.find(v=>v.scriptURL.endsWith('/runtime/0.1.17/background.js'));assert.ok(workerVersion);

@@ -1,5 +1,5 @@
 (() => {
-  const revision='0.1.19';
+  const revision='0.2.3';
   if(window.__kolObserverInstalled===revision)return;
   // Retain the dependencies used at installation for asynchronous callbacks.
   const pageData=globalThis.KOLPageData,renderedData=globalThis.KOLRenderedData;
