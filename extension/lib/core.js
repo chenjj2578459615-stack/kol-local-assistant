@@ -1,11 +1,14 @@
 import './video-data.js';
 import './youtube.js';
+import {sourcePlatform,discoverAccounts} from './platforms.js';
 export const normalizeYouTube=globalThis.KOLYouTube.normalize;
 export const FIELDS = [
   ['url', 'TikTok 主页 URL'], ['contact', '联系方式'], ['handle', '博主 ID'],
   ['gender', '性别'], ['name', '博主名称'], ['followers', 'TikTok 粉丝量'],
   ['median', '中位播放数'], ['average', '平均播放数'], ['tier', '量级'],
-  ['instagramFollowers', 'Instagram 粉丝量'], ['youtubeSubscribers', 'YouTube 订阅数'], ['types', '达人类型']
+  ['tiktokUrl','TikTok 主页 URL'], ['tiktokFollowers','TikTok 粉丝量'],
+  ['instagramUrl','Instagram 主页 URL'], ['instagramFollowers', 'Instagram 粉丝量'],
+  ['youtubeUrl','YouTube 频道 URL'], ['youtubeSubscribers', 'YouTube 订阅数'], ['types', '达人类型']
 ].map(([key, label]) => ({key, label}));
 export const DAY = 86400000;
 export function normalizeStatsConfig(config={}){
@@ -14,7 +17,7 @@ export function normalizeStatsConfig(config={}){
   let statsDays=config.statsDays??30,statsCount=config.statsCount??5;
   if(!Number.isInteger(statsDays)||statsDays<1||statsDays>3650){if(mode==='days')throw new Error('统计天数请输入 1–3650 的整数。');statsDays=30;}
   if(!Number.isSafeInteger(statsCount)||statsCount<1){if(mode==='videos')throw new Error('视频条数请输入大于0的整数。');statsCount=5;}
-  return {statsMode:mode,statsDays,statsCount,brands:String(config.brands||'')};
+  return {sourcePlatform:sourcePlatform(config),statsMode:mode,statsDays,statsCount,brands:String(config.brands||'')};
 }
 export function statsLabel(config){return config.statsMode==='videos'?`最近 ${config.statsCount} 条视频`:`近 ${config.statsDays} 天`;}
 export function collectionDays(config){return Math.max(config.statsMode==='videos'?0:config.statsDays,keywords(config.brands).length?180:0);}
@@ -26,7 +29,7 @@ export function rangeComplete(row,days,now=Date.now()){
 function sampleSelection(videos,setting,now){
   const config=typeof setting==='number'?{statsDays:setting}:setting;
   const unique=[...new Map(videos.filter(v=>v.id).map(v=>[v.id,v])).values()];
-  const dated=unique.filter(v=>Number.isFinite(v.createdAt)&&v.createdAt<=now).sort((a,b)=>b.createdAt-a.createdAt||String(b.id).localeCompare(String(a.id)));
+  const dated=unique.filter(v=>v.statEligible!==false&&Number.isFinite(v.createdAt)&&v.createdAt<=now).sort((a,b)=>b.createdAt-a.createdAt||String(b.id).localeCompare(String(a.id)));
   const samples=config.statsMode==='videos'?dated.slice(0,config.statsCount):dated.filter(v=>v.createdAt>=now-config.statsDays*DAY);
   return {unique,samples};
 }
@@ -80,7 +83,7 @@ export function formatFollowers(value){
   if(rounded>=1000&&index<units.length-1){index++;rounded=Math.round((count/units[index].size+Number.EPSILON)*100)/100;}
   return `${rounded}${units[index].label}`;
 }
-export function fieldText(key,value){if(key==='gender'&&/^(未知|unknown)$/i.test(String(value??'').trim()))return '';return ['followers','instagramFollowers','youtubeSubscribers'].includes(key)?formatFollowers(value):String(value??'');}
+export function fieldText(key,value){if(key==='gender'&&/^(未知|unknown)$/i.test(String(value??'').trim()))return '';return ['followers','tiktokFollowers','instagramFollowers','youtubeSubscribers'].includes(key)?formatFollowers(value):String(value??'');}
 export function tier(followers) {
   if (followers === null || followers === undefined || followers === '') return '';
   const n = Number(followers);
@@ -111,7 +114,7 @@ export function matchBrands(videos, brands, now = Date.now(), days = 180) {
 }
 export function statistics(videos, setting, now = Date.now()) {
   const {unique,samples}=sampleSelection(videos,setting,now);
-  const unknownDates = unique.filter(v=>!Number.isFinite(v.createdAt)).length;
+  const unknownDates = unique.filter(v=>v.statEligible!==false&&!Number.isFinite(v.createdAt)).length;
   const missing = samples.filter(v=>!Number.isFinite(v.views) || v.views<0 || v.approxViews).length;
   const values = samples.filter(v=>Number.isFinite(v.views) && v.views>=0 && !v.approxViews).map(v=>v.views).sort((a,b)=>a-b);
   if (!values.length) return {average:null, median:null, count:samples.length, missing, unknownDates};
@@ -126,8 +129,8 @@ export function statisticsAudit(row,config,now=Date.now()){
   const posts=unique.map(v=>{
     const inRange=selected.has(v.id);
     const exact=Number.isFinite(v.views)&&v.views>=0&&!v.approxViews;
-    const reason=!Number.isFinite(v.createdAt)?'发布时间缺失':v.createdAt>end?'晚于统计截止':!inRange?(byCount?'不在最近N条内':'早于统计范围'):!exact?'播放量缺失或为缩略值':'计入统计';
-    return {id:v.id,url:v.url,publishedAt:Number.isFinite(v.createdAt)?new Date(v.createdAt).toISOString():null,views:v.views??null,pinned:!!v.pinned,included:inRange&&exact,reason,source:v.source||'unknown',observedAt:v.observedAt?new Date(v.observedAt).toISOString():null};
+    const reason=v.statEligible===false?'非视频作品，不计播放统计':!Number.isFinite(v.createdAt)?'发布时间缺失':v.createdAt>end?'晚于统计截止':!inRange?(byCount?'不在最近N条内':'早于统计范围'):!exact?'播放量缺失或为缩略值':'计入统计';
+    return {id:v.id,url:v.url,publishedAt:Number.isFinite(v.createdAt)?new Date(v.createdAt).toISOString():null,datePrecision:v.datePrecision||'time',views:v.views??null,pinned:!!v.pinned,included:inRange&&exact&&v.statEligible!==false,reason,source:v.source||'unknown',observedAt:v.observedAt?new Date(v.observedAt).toISOString():null};
   }).sort((a,b)=>(b.publishedAt||'').localeCompare(a.publishedAt||'')||a.id.localeCompare(b.id));
   const stats=statistics(unique,config,end),included=posts.filter(p=>p.included),sum=included.reduce((n,p)=>n+p.views,0);
   return {handle:row.handle,mode:byCount?'videos':'days',label:statsLabel(config),requestedCount:byCount?config.statsCount:null,days:byCount?null:config.statsDays,start:new Date(start).toISOString(),end:new Date(end).toISOString(),rangeComplete:statsComplete(row,config,end),count:stats.count,validCount:included.length,sum,average:stats.average,median:stats.median,missing:stats.missing,unknownDates:stats.unknownDates,formula:byCount?'同一视频ID去重；按发布时间倒序选最近N条（包含视频和图文）；置顶按实际时间排序；缺失播放数不以更旧视频补位':'同一视频 ID 去重；发布时间在起止时间内；按原始播放数计算；范围内置顶视频照常计入',posts};
@@ -249,8 +252,16 @@ export function resultFor(row, config, now) {
   const links=matchBrands(row.videos||[], keywords(config.brands), now);
   const valid=statsComplete(row,config,now)&&!stats.missing&&!stats.unknownDates;
   const categorySamples=sampleSelection(row.videos||[],config,now).samples;
+  const platform=row.platform||sourcePlatform(config),accounts=discoverAccounts(p);
   const out={url:row.url,contact:row.contact,handle:`@${row.handle}`,gender:p.gender||'',name:p.name||'',followers:p.followers??'',median:valid?stats.median??'':'',average:valid?stats.average??'':'',tier:tier(p.followers),instagramFollowers:row.instagramFollowers??'',youtubeSubscribers:row.youtubeSubscribers??'',types:classify(categorySamples,p.bio),brandLinks:rangeComplete(row,180,now)&&!stats.unknownDates?Object.entries(links).filter(([,urls])=>urls.length).map(([brand,urls])=>`${brand}: ${urls.join(' | ')}`).join('\n'):''};
   const result={...out,...row.overrides};
+  Object.assign(result,{
+    tiktokUrl:platform==='tiktok'?row.url:row.tiktok||accounts.tiktok||'',tiktokFollowers:platform==='tiktok'?out.followers:row.tiktokFollowers??'',
+    instagramUrl:platform==='instagram'?row.url:row.instagram?`https://www.instagram.com/${row.instagram}/`:accounts.instagram||'',
+    youtubeUrl:platform==='youtube'?row.url:row.youtube||accounts.youtube||''
+  },row.overrides);
+  if(row.aiResult?.types&&!Object.hasOwn(row.overrides||{},'types'))result.types=row.aiResult.types;
+  if(row.aiResult?.gender&&!p.gender&&!Object.hasOwn(row.overrides||{},'gender'))result.gender=row.aiResult.gender;
   if(Object.hasOwn(row.overrides||{},'followers')&&!Object.hasOwn(row.overrides||{},'tier'))result.tier=tier(result.followers);
   if(p.approxFollowers&&!Object.hasOwn(row.overrides||{},'followers'))result.followers='';
   return result;
@@ -272,7 +283,7 @@ export function tsvCell(value) {
   return /[\t\n\r"]/.test(s)?`"${s.replace(/"/g,'""')}"`:s;
 }
 export function toTSV(rows, columns, withHeaders=true) {
-  const lines=rows.map(row=>columns.map(col=>tsvCell(['followers','instagramFollowers','youtubeSubscribers','gender'].includes(col.key)?fieldText(col.key,row[col.key]):row[col.key])).join('\t'));
+  const lines=rows.map(row=>columns.map(col=>tsvCell(['followers','tiktokFollowers','instagramFollowers','youtubeSubscribers','gender'].includes(col.key)?fieldText(col.key,row[col.key]):row[col.key])).join('\t'));
   if(withHeaders) lines.unshift(columns.map(col=>tsvCell(col.label)).join('\t'));
   return lines.join('\r\n');
 }

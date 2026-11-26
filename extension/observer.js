@@ -44,7 +44,8 @@
     for(const content of contents)for(const t of Array.isArray(content.textExtra)?content.textExtra:[])hashtagValues.push(t?.hashtagName);
     const hashtags=[...new Set(hashtagValues.filter(Boolean).map(String))];
     const description=descriptionValues.join(' ').trim();
-    return {id,handle:String(author),url:`https://www.tiktok.com/@${author}/${item.imagePost?'photo':'video'}/${id}`,description,hashtags,tags:hashtags,createdAt,views:count(item.stats?.playCount??item.statsV2?.playCount??item.statistics?.play_count),approxViews:false,pinned:flag(item.isPinnedItem)===true};
+    const thumbnailUrl=item.video?.cover||item.video?.originCover||item.imagePost?.images?.[0]?.imageURL?.urlList?.[0]||'';
+    return {id,handle:String(author),url:`https://www.tiktok.com/@${author}/${item.imagePost?'photo':'video'}/${id}`,description,hashtags,tags:hashtags,thumbnailUrl,createdAt,views:count(item.stats?.playCount??item.statsV2?.playCount??item.statistics?.play_count),approxViews:false,pinned:flag(item.isPinnedItem)===true};
   }
   function extract(payload) {
     const profiles=[],videos=[];let listing=null;

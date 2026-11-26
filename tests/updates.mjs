@@ -1,0 +1,109 @@
+import {chromium} from 'playwright';
+import {readFile,writeFile,mkdir,cp,readdir,rm} from 'node:fs/promises';
+import {spawnSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
+import {fileURLToPath,pathToFileURL} from 'node:url';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+const root=fileURLToPath(new URL('../',import.meta.url));
+const {version}=JSON.parse(await readFile(path.join(root,'extension/manifest.json'),'utf8'));
+const source=path.join(root,'dist',`KOL插件-${version}`);
+const work=path.join('D:/ChatGPT/dev-cache/kol-tests',`updates-${Date.now()}`);
+const target=path.join(work,'installed'),ext=path.join(target,'extension');
+const out=path.join(root,'artifacts',`revision-${version}`),passed=[],errors=[];
+await mkdir(work,{recursive:true});await mkdir(out,{recursive:true});
+function install(bundle,expected=0,targetRoot=target){
+  const r=spawnSync('powershell.exe',['-NoProfile','-STA','-ExecutionPolicy','Bypass','-File',path.join(bundle,'install.ps1'),'-TargetRoot',targetRoot,'-Quiet','-SkipUpdaterRegistration'],{windowsHide:true,encoding:'utf8'});
+  assert.equal(r.status,expected,r.stdout+'\n'+r.stderr);return r.stdout;
+}
+async function poll(fn,timeout=20000){let error;const end=Date.now()+timeout;while(Date.now()<end){try{return await fn();}catch(e){error=e;await new Promise(r=>setTimeout(r,180));}}throw error;}
+const send=(page,type,extra={})=>page.evaluate(async message=>{const r=await chrome.runtime.sendMessage(message);if(!r?.ok)throw new Error(r?.error||'Missing response');return r.data;},{type,...extra});
+async function rehash(bundle){const hashes={},dir=path.join(bundle,'extension');async function walk(folder){for(const ent of await readdir(folder,{withFileTypes:true})){const file=path.join(folder,ent.name);if(ent.isDirectory())await walk(file);else hashes[path.relative(dir,file).replaceAll('\\','/')]=createHash('sha256').update(await readFile(file)).digest('hex');}}await walk(dir);const m=JSON.parse(await readFile(path.join(dir,'manifest.json'),'utf8'));await writeFile(path.join(bundle,'bundle.json'),JSON.stringify({...JSON.parse(await readFile(path.join(bundle,'bundle.json'))),version:m.version,hashes}));}
+let ctx,success=false;
+try{
+  install(source);
+  const manifest=JSON.parse(await readFile(path.join(ext,'manifest.json'),'utf8'));
+  assert.ok(manifest.permissions.includes('nativeMessaging'));assert.equal(manifest.background.service_worker,`runtime/${version}/background.js`);
+  passed.push('真实 PowerShell 安装：固定目录、文件校验、独立插件、无需桌面进程。');
+  ctx=await chromium.launchPersistentContext(path.join(work,'chrome-profile'),{executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe',headless:true,ignoreDefaultArgs:['--disable-extensions'],args:['--enable-unsafe-extension-debugging'],viewport:{width:1366,height:768}});
+  ctx.on('page',p=>p.on('pageerror',e=>errors.push(e.message)));
+  const cdp=await ctx.browser().newBrowserCDPSession(),browser=await cdp.send('Browser.getVersion');
+  const management=ctx.pages()[0];await management.goto('chrome://extensions');
+  await management.evaluate(()=>new Promise(resolve=>chrome.developerPrivate.updateProfileConfiguration({inDeveloperMode:true},resolve)));
+  const {id}=await cdp.send('Extensions.loadUnpacked',{path:ext});
+  let page=await poll(async()=>{const p=ctx.pages().find(p=>p.url().endsWith(`/runtime/${version}/app.html`));assert.ok(p);await p.waitForSelector('#entry-body input',{timeout:500});return p;});
+  assert.equal(id,'pfhhlengpocinfdkkjjnmffbpgjacicl');
+  await send(page,'IMPORT',{rows:[{url:'https://www.tiktok.com/@updatetest',contact:'运营+更新@example.com',instagramFollowers:45678}]});
+  await page.locator('#entry-body input[data-key="url"]').fill('https://www.tiktok.com/@drafttest');
+  await page.locator('#entry-body input[data-key="contact"]').fill('草稿联系方式');
+  await page.locator('#brands').fill('apple, Apple');await page.locator('#stats-days').fill('180');await page.locator('#stats-days').press('Tab');
+  await poll(async()=>{const s=await send(page,'GET');assert.equal(s.draft.entries[0].contact,'草稿联系方式');assert.equal(s.config.statsDays,180);return s;});
+  await page.locator('#stats-unit').selectOption('videos');await page.locator('#stats-count').fill('37');await page.locator('#stats-count').press('Tab');
+  const columns=(await send(page,'GET')).columns.reverse();await send(page,'COLUMNS',{columns});
+  const batchBefore=(await send(page,'GET')).batch.id;
+  await page.screenshot({path:path.join(out,'01-插件工作台.png')});
+  assert.ok(await page.locator('#start').evaluate(el=>el.getBoundingClientRect().bottom<=innerHeight),'主操作应在常用桌面视口内');
+  await page.locator('#apply-update').click();await page.locator('#help-open').click();await page.screenshot({path:path.join(out,'02-使用与更新.png')});await page.locator('[data-close="help-dialog"]').click();
+  await ctx.route('https://www.tiktok.com/**',route=>route.fulfill({contentType:'text/html',body:'<!doctype html><title>Existing platform fixture</title><p>Existing platform tab</p>'}));
+  const platform=await ctx.newPage();await platform.goto('https://www.tiktok.com/login');
+  // A fixture site tab, without account cookies: toolbar and update must leave it untouched.
+  const platformUrl=platform.url();let navigations=0;platform.on('framenavigated',()=>navigations++);
+  const targets=await cdp.send('Target.getTargets',{filter:[{exclude:false}]});
+  const platformTarget=targets.targetInfos.find(t=>t.type==='tab'&&t.url===platformUrl);
+  assert.ok(platformTarget,JSON.stringify(targets.targetInfos));
+  for(let i=0;i<3;i++)await cdp.send('Extensions.triggerAction',{id,targetId:platformTarget.targetId});
+  await poll(async()=>{assert.equal(ctx.pages().filter(p=>p.url().endsWith('/app.html')).length,1);assert.equal(await page.evaluate(()=>document.visibilityState),'visible');});
+  assert.equal(navigations,0);assert.equal(platform.url(),platformUrl);
+  passed.push(`正式 ${browser.product}：首次加载自动打开；触发三次工具栏动作仍只有一个工作台，原平台页未导航或刷新。`);
+  // Simulate the NEXT release; the delivered version stays unchanged.
+  const nextVersion=version.replace(/\d+$/,n=>String(Number(n)+1)),next=path.join(work,'next');
+  await cp(source,next,{recursive:true});
+  await cp(path.join(next,'extension/runtime',version),path.join(next,'extension/runtime',nextVersion),{recursive:true});
+  await rm(path.join(next,'extension/runtime',version),{recursive:true});
+  const nextManifest={...manifest,version:nextVersion,background:{service_worker:`runtime/${nextVersion}/background.js`,type:'module'},options_ui:{page:`runtime/${nextVersion}/app.html`,open_in_tab:true}};
+  await writeFile(path.join(next,'extension/manifest.json'),JSON.stringify(nextManifest));
+  await writeFile(path.join(next,'extension/release.json'),JSON.stringify({version:nextVersion,ready:true}));await rehash(next);
+  const broken=path.join(work,'broken');await cp(next,broken,{recursive:true});await writeFile(path.join(broken,'extension/runtime',nextVersion,'app.js'),'corrupt fixture');
+  const before=await readFile(path.join(ext,'manifest.json'),'utf8');assert.match(install(broken,1),/校验失败/);assert.equal(await readFile(path.join(ext,'manifest.json'),'utf8'),before);
+  passed.push('损坏更新包被拒绝，当前 manifest 和已安装版本保持原样。');
+  await page.bringToFront();install(next);
+  const update=await send(page,'UPDATE_STATUS');assert.equal(update.current,version);assert.equal(update.version,nextVersion);assert.equal(update.available,true);
+  assert.equal(await readFile(path.join(ext,'runtime',version,'background.js'),'utf8'),await readFile(path.join(source,'extension/runtime',version,'background.js'),'utf8'));
+  await page.locator('#update-ready').waitFor({state:'visible',timeout:12000});
+  // Set only the worker's status, without actually starting a platform collection.
+  const workerControl=await ctx.newCDPSession(page);let workerVersions=[];
+  workerControl.on('ServiceWorker.workerVersionUpdated',event=>workerVersions=event.versions.concat(workerVersions));await workerControl.send('ServiceWorker.enable');
+  const workerVersion=await poll(async()=>{const v=workerVersions.find(v=>v.scriptURL.endsWith(`/runtime/${version}/background.js`));assert.ok(v);return v;});
+  await page.evaluate(async()=>{const data=await chrome.storage.local.get('kolStateV1');data.kolStateV1.run.status='running';await chrome.storage.local.set(data);});
+  await workerControl.send('ServiceWorker.stopWorker',{versionId:workerVersion.versionId});
+  await poll(async()=>assert.equal((await send(page,'GET')).run.status,'running'));
+  await page.locator('#apply-update').click();await poll(async()=>assert.equal(await page.locator('#version-install').isDisabled(),true));
+  await assert.rejects(send(page,'APPLY_UPDATE'),/先暂停/);
+  await send(page,'PAUSE');await poll(async()=>assert.equal(await page.locator('#version-install').isEnabled(),true));
+  await page.screenshot({path:path.join(out,'03-更新只有一个动作.png')});
+  assert.ok(await page.locator('#start').evaluate(el=>el.getBoundingClientRect().bottom<=innerHeight),'更新和状态提示不得挤掉主操作');
+  await page.locator('#version-install').click();
+  page=await poll(async()=>{const p=ctx.pages().find(p=>p.url().endsWith(`/runtime/${nextVersion}/app.html`));assert.ok(p);await p.waitForSelector('#entry-body input',{timeout:500});return p;});
+  const after=await send(page,'GET');assert.equal(after.rows[0].contact,'运营+更新@example.com');assert.equal(after.rows[0].instagramFollowers,45678);assert.equal(after.draft.entries[0].contact,'草稿联系方式');assert.equal(after.config.brands,'apple, Apple');assert.equal(after.config.statsDays,180);assert.equal(after.config.statsMode,'videos');assert.equal(after.config.statsCount,37);assert.deepEqual(after.columns,columns);
+  assert.equal(after.batch.id,batchBefore);assert.ok(after.history.some(b=>b.id===batchBefore));
+  const savedBatch=await send(page,'HISTORY_GET',{id:batchBefore});assert.equal(savedBatch.rows[0].contact,'运营+更新@example.com');assert.deepEqual(savedBatch.columns,columns);
+  assert.equal(navigations,0);assert.equal(platform.url(),platformUrl);assert.equal((await send(page,'UPDATE_STATUS')).current,nextVersion);
+  assert.equal(ctx.pages().filter(p=>p.url().endsWith('/app.html')).length,1,JSON.stringify(ctx.pages().map(p=>p.url())));
+  install(source,1);assert.equal(JSON.parse(await readFile(path.join(ext,'manifest.json'),'utf8')).version,nextVersion);
+  passed.push('真实文件更新→提示→采集中禁用并拒绝→暂停→点击应用→自动回到新版：达人、联系方式、Ins 粉丝、未提交草稿、品牌设置和列顺序全部保留；拒绝降级。');
+  await page.setViewportSize({width:842,height:667});await page.locator('#apply-update').click();await page.locator('#help-open').click();
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+  await page.screenshot({path:path.join(out,'04-小窗口帮助.png'),fullPage:true});
+  await page.locator('[data-close="help-dialog"]').click();
+  await page.setViewportSize({width:842,height:667});
+  await page.screenshot({path:path.join(out,'06-小窗口工作台.png'),fullPage:true});
+  const guide=await ctx.newPage();await guide.goto(pathToFileURL(path.join(source,'先看这里.html')).href);await guide.setViewportSize({width:1366,height:768});await guide.screenshot({path:path.join(out,'05-首次使用指南.png'),fullPage:true});
+  assert.deepEqual(errors,[]);
+  passed.push('简化帮助和首次安装指南已渲染；1366×768 与 842×667 布局无横向溢出。');
+  // Preserve the identity of a previous manually loaded (no key) installation.
+  const legacy=path.join(work,'legacy'),legacyExt=path.join(legacy,'extension');await mkdir(legacyExt,{recursive:true});await writeFile(path.join(legacyExt,'manifest.json'),JSON.stringify({name:manifest.name,version:'0.1.4',manifest_version:3}));install(source,0,legacy);
+  assert.equal(Object.hasOwn(JSON.parse(await readFile(path.join(legacyExt,'manifest.json'),'utf8')),'key'),false);
+  passed.push('迁移时沿用已有 key；无 key 的旧手动安装保持无 key，避免更新改变插件身份。');
+  await writeFile(path.join(out,'updates-results.json'),JSON.stringify({browser:browser.product,passed,errors,note:'独立测试用户；使用测试数据，不代表真实平台完整采集验收。'},null,2));success=true;
+  console.log(JSON.stringify({passed,errors,out},null,2));
+}finally{if(ctx)await ctx.close();if(success&&path.resolve(work).startsWith(path.resolve('D:/ChatGPT/dev-cache/kol-tests')+path.sep))await rm(work,{recursive:true});else console.log('Diagnostics retained:',work);}

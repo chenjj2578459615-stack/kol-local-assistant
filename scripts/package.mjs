@@ -1,0 +1,47 @@
+import {mkdir,copyFile,cp,readFile,writeFile,readdir} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
+import {spawnSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
+import path from 'node:path';
+import {buildObserver} from './build-observer.mjs';
+import {buildUpdater} from './build-updater.mjs';
+await buildObserver();
+const root=fileURLToPath(new URL('../',import.meta.url));
+const manifest=JSON.parse(await readFile(`${root}extension/manifest.json`,'utf8'));
+const {version}=manifest;
+const notes=await readFile(path.join(root,`releases/${version}.md`),'utf8');
+const updater=await buildUpdater();
+const dist=path.join(root,'dist'),folder=path.join(dist,`KOL插件-${version}`),ext=path.join(folder,'extension');
+const runtime=`runtime/${version}`;
+await mkdir(ext,{recursive:true});
+await cp(path.join(root,'extension'),path.join(ext,runtime),{recursive:true,filter:file=>!file.endsWith('desktop.js')});
+await cp(path.join(root,'extension/icons'),path.join(ext,'icons'),{recursive:true});
+manifest.key=(await readFile(path.join(root,'desktop/extension-key.txt'),'utf8')).trim();
+manifest.background.service_worker=`${runtime}/background.js`;
+manifest.options_ui.page=`${runtime}/app.html`;
+await writeFile(path.join(ext,'manifest.json'),JSON.stringify(manifest,null,2)+'\n');
+await writeFile(path.join(ext,'release.json'),JSON.stringify({version,ready:true})+'\n');
+const hashes={};
+async function hashTree(dir){for(const item of await readdir(dir,{withFileTypes:true})){
+  const full=path.join(dir,item.name);if(item.isDirectory())await hashTree(full);
+  else hashes[path.relative(ext,full).replaceAll('\\','/')]=createHash('sha256').update(await readFile(full)).digest('hex');
+}}
+await hashTree(ext);
+await mkdir(path.join(folder,'updater'),{recursive:true});await copyFile(updater,path.join(folder,'updater/KOLUpdater.exe'));
+await writeFile(path.join(folder,'bundle.json'),JSON.stringify({version,hashes,updaterSha256:createHash('sha256').update(await readFile(updater)).digest('hex')},null,2)+'\n');
+await writeFile(path.join(folder,'更新内容.md'),notes);
+await writeFile(path.join(ext,runtime,'release-notes.json'),JSON.stringify({version,notes})+'\n');
+// The embedded notes are runtime assets and must be included in the hash list.
+hashes[`${runtime}/release-notes.json`]=createHash('sha256').update(await readFile(path.join(ext,runtime,'release-notes.json'))).digest('hex');
+await writeFile(path.join(folder,'bundle.json'),JSON.stringify({version,hashes,updaterSha256:createHash('sha256').update(await readFile(updater)).digest('hex')},null,2)+'\n');
+await writeFile(path.join(folder,'install.ps1'),'\ufeff'+await readFile(path.join(root,'scripts/install.ps1'),'utf8'));
+await writeFile(path.join(folder,'安装或更新.cmd'),'@echo off\r\npowershell.exe -NoLogo -NoProfile -STA -ExecutionPolicy Bypass -File "%~dp0install.ps1"\r\nif errorlevel 1 pause\r\n');
+await copyFile(path.join(root,'scripts/guide.html'),path.join(folder,'先看这里.html'));
+await copyFile(path.join(root,'README.md'),path.join(folder,'使用说明.md'));
+await cp(path.join(root,'docs'),path.join(folder,'docs'),{recursive:true});
+const quote=s=>`'${s.replaceAll("'","''")}'`;
+const result=spawnSync('powershell.exe',['-NoProfile','-Command',`Compress-Archive -LiteralPath ${quote(folder)} -DestinationPath ${quote(path.join(dist,`KOL插件-${version}.zip`))} -Force`],{encoding:'utf8',windowsHide:true});
+if(result.status)throw new Error(result.stderr);
+const zip=path.join(dist,`KOL插件-${version}.zip`),githubZip=path.join(dist,`KOL-Assistant-${version}-windows.zip`);await copyFile(zip,githubZip);
+const payload=await readFile(zip),metadata={schema:1,repository:'chenjj2578459615-stack/kol-local-assistant',version,asset:path.basename(githubZip),bytes:payload.length,sha256:createHash('sha256').update(payload).digest('hex'),notes};
+await writeFile(path.join(dist,'kol-update.json'),JSON.stringify(metadata,null,2)+'\n');console.log(zip);

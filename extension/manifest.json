@@ -1,20 +1,22 @@
 {
   "manifest_version": 3,
   "name": "KOL 本地助手",
-  "description": "本地整理 TikTok 达人资料、品牌关键词视频与表格输出。",
-  "version": "0.1.19",
+  "description": "批量整理 TikTok、Instagram、YouTube 达人资料、品牌关键词与表格输出，可选 AI 内容分类。",
+  "version": "0.2.1",
   "minimum_chrome_version": "120",
   "permissions": [
     "storage",
     "scripting",
     "alarms",
     "unlimitedStorage",
-    "clipboardWrite"
+    "clipboardWrite",
+    "nativeMessaging"
   ],
   "optional_host_permissions": [
     "https://*.tiktok.com/*",
     "https://*.instagram.com/*",
-    "https://*.youtube.com/*"
+    "https://*.youtube.com/*",
+    "https://*/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -34,5 +36,11 @@
     "16": "icons/16.png",
     "48": "icons/48.png",
     "128": "icons/128.png"
-  }
+  },
+  "host_permissions": [
+    "https://api.github.com/*",
+    "https://github.com/*",
+    "https://release-assets.githubusercontent.com/*",
+    "https://objects.githubusercontent.com/*"
+  ]
 }

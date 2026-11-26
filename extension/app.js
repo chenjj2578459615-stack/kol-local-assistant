@@ -1,15 +1,21 @@
 import {FIELDS,parseClipboard,normalizeProfile,normalizeInstagram,normalizeYouTube,parseCount,toTSV,keywords,matchBrands,rangeComplete,statisticsAudit,statsLabel,statsComplete,fieldText} from './lib/core.js';
 import {brandState} from './lib/presentation.js';
+import {setupVersionUpdates} from './version-ui.js';
+import {PLATFORMS,sourcePlatform,normalizeCreator,creatorKey,fieldsFor,selectColumns} from './lib/platforms.js';
+import {attachColumnAutoScroll} from './lib/column-drag.js';
+import {validateAIConfig,IMAGE_ORIGINS} from './lib/ai.js';
 const $=id=>document.getElementById(id);
 const STORE='kolStateV1';
 let state,entries=[],pasteEntries=[],columnDraft=[],editingId=null,editOriginal={},draftTimer,toastTimer,dragged=null;
 let historyView=null,currentPage='input',historyLoadId=0,statusRowId=null,brandRowId=null;
+let columnDragSession=null;
+let historyPlatform='tiktok';
 const resultState=()=>historyView||state;
-const outputColumns=shown=>{
-  const columns=shown.columns.filter(c=>FIELDS.some(f=>f.key===c.key));
-  if(!columns.some(c=>c.key==='youtubeSubscribers')){const after=columns.findIndex(c=>c.key==='instagramFollowers');columns.splice(after>=0?after+1:columns.length,0,{...FIELDS.find(f=>f.key==='youtubeSubscribers'),visible:true});}
-  return columns.filter(c=>c.visible);
-};
+const primary=()=>sourcePlatform(state?.config);
+const displayedPlatform=()=>historyView?sourcePlatform(historyView.config):currentPage==='history'?historyPlatform:primary();
+const creator=value=>normalizeCreator(value,primary());
+const activeFields=()=>fieldsFor(FIELDS,sourcePlatform(resultState().config));
+const outputColumns=shown=>selectColumns(shown.columns,FIELDS,sourcePlatform(shown.config)).filter(c=>c.visible);
 const rowNames={queued:'等待读取',running:'正在读取',paused:'已暂停',complete:'已读取',partial:'需要检查'};
 function rowKind(row){return row.outcome?.kind||(row.access?.kind==='access_denied'?'access_denied':'')||(/未找到该达人|找不到此账号|账号不存在/.test(row.note||'')?'not_found':'');}
 function rowDisplayStatus(row){return ({not_found:'账号不存在',private:'私密账号',empty_range:'范围内无作品',access_denied:'访问被拒绝'})[rowKind(row)]||rowNames[row.status]||row.status;}
@@ -23,7 +29,7 @@ function showPage(page){
   currentPage=page;
   for(const n of document.querySelectorAll('nav [data-page]')){const viewingHistory=page==='history'||!!historyView,active=n.dataset.page==='history'?viewingHistory:!viewingHistory;n.classList.toggle('active',active);n.setAttribute('aria-current',active?'page':'false');n.setAttribute('aria-selected',String(active));}
   for(const name of ['input','results','history'])$(`page-${name}`).hidden=page!==name;
-  if(page==='history')renderHistory();
+  if(page==='history')renderHistory();renderSourceTabs();
 }
 function goCurrent(){historyLoadId++;historyView=null;render();showPage(state.rows.length?'results':'input');}
 async function openHistory(id){
@@ -45,10 +51,10 @@ function validateEntries(){
   const errors=[],rows=[],seen=new Set();
   entries.forEach((e,i)=>{
     if(!entryKeys.some(k=>String(e[k]||'').trim()))return;
-    const p=normalizeProfile(e.url),issues={};
-    if(!p)issues.url='请输入 TikTok 主页链接';
-    if(p&&seen.has(p.handle.toLowerCase()))issues.url='此达人重复，请合并为一行';
-    if(p)seen.add(p.handle.toLowerCase());
+    const p=creator(e.url),issues={};
+    if(!p)issues.url=`请输入 ${PLATFORMS[primary()].name} 主页链接`;
+    if(p&&seen.has(creatorKey(p)))issues.url='此达人重复，请合并为一行';
+    if(p)seen.add(creatorKey(p));
     if(e.instagram&&!normalizeInstagram(e.instagram))issues.instagram='Instagram 账号格式有误';
     if(e.youtube&&!normalizeYouTube(e.youtube))issues.youtube='YouTube 频道链接格式有误';
     if(e.instagramFollowers&&parseCount(e.instagramFollowers)===null)issues.instagramFollowers='请输入有效粉丝量';
@@ -76,8 +82,8 @@ function renderEntries(){
     const tr=node('tr');tr.dataset.row=i;tr.append(node('td',String(i+1),'entry-number'));
     entryKeys.forEach((key,j)=>{
       const td=node('td'),input=node('input');input.value=e[key]||'';input.dataset.row=i;input.dataset.key=key;input.spellcheck=false;
-      input.setAttribute('aria-label',`第 ${i+1} 位达人${[' TikTok 主页 URL','联系方式',' Instagram 账号',' Instagram 粉丝量'][j]}`);
-      input.placeholder=['https://www.tiktok.com/@username','邮箱 / 微信 / 其他','@username','例如 12000'][j];
+      input.setAttribute('aria-label',`第 ${i+1} 位达人${[` ${PLATFORMS[primary()].name} 主页 URL`,'联系方式',' Instagram 账号',' Instagram 粉丝量'][j]}`);
+      input.placeholder=[PLATFORMS[primary()].placeholder,'邮箱 / 微信 / 其他','@username','例如 12000'][j];
       if(key==='instagramFollowers')input.inputMode='decimal';
       input.addEventListener('input',()=>{entries[i][key]=input.value;updateEntryValidation();queueDraft();});
       input.addEventListener('paste',event=>{const value=event.clipboardData.getData('text/plain');if(/[\t\r\n]/.test(value)){event.preventDefault();openImport(value);}});
@@ -112,7 +118,8 @@ function render(){
   $('run-label').textContent=readonly?`已保存 · ${complete}/${total} 已完成`:running?`${state.run.phase==='recovering'?'正在恢复页面连接':'正在读取'} · ${complete}/${total} 已完成`:state.run.status==='finished'?`处理结束 · ${complete}/${total} 已完成`:state.run.status==='blocked'?'读取已暂停，请查看原因':state.run.status==='paused'?'已暂停，进度已保存':'等待开始';
   renderRangeHint();
   $('empty').hidden=!!total;$('table-wrap').hidden=!total;
-  const tt=state.connections.tiktok,good=['public','connected'].includes(tt.kind);
+  renderSourceTabs();$('ai-entry-text').textContent=state.ai?.enabled?'AI 已开启':'AI 辅助';
+  const tt=state.connections[primary()],good=['public','connected'].includes(tt.kind);
   $('connection-label').textContent=good?connectionNames[tt.kind]:'连接管理';
   $('connection-dot').className=`dot ${good?'good':tt.kind==='not_granted'?'':'warn'}`;
   renderConnections();
@@ -120,10 +127,10 @@ function render(){
   renderUpdate();
   if(currentPage==='history')renderHistory();
   if($('status-dialog').open)renderStatus();if($('brand-dialog').open)renderBrand();
-  if(editingId&&$('row-dialog').open){const row=shown.rows.find(r=>r.id===editingId);if(row){$('row-status').textContent=rowDisplayStatus(row)||row.status;$('row-notice').textContent=row.note;renderInstagramStatus(row);renderYouTubeStatus(row);renderAudit(row);renderLinks(row);}}
+  if(editingId&&$('row-dialog').open){const row=shown.rows.find(r=>r.id===editingId);if(row){$('row-status').textContent=rowDisplayStatus(row)||row.status;$('row-notice').textContent=row.note;renderInstagramStatus(row);renderYouTubeStatus(row);renderAIStatus(row);renderAudit(row);renderLinks(row);}}
 }
 function renderHistory(){
-  const batches=state?.history||[];$('history-empty').hidden=!!batches.length;
+  const batches=(state?.history||[]).filter(b=>(b.sourcePlatform||'tiktok')===historyPlatform);$('history-empty').hidden=!!batches.length;
   const fragment=document.createDocumentFragment();
   for(const batch of batches){
     const item=node('article',undefined,'history-item'),text=node('div');text.append(node('h2',new Date(batch.createdAt).toLocaleString('zh-CN',{hour12:false})),node('p',`${batch.count} 位达人 · ${statsLabel(batch)}播放统计${keywords(batch.brands).length?' · 180 天品牌检索':''}`),node('p',(batch.handles||[]).map(h=>'@'+h).join('、'),'history-handles'));
@@ -145,7 +152,7 @@ function renderConnections(){
     const p=item.dataset.platform,base=connectionErrors[p]||state.connections[p],busy=connectionBusy[p];
     const c=busy?{kind:busy,message:busy==='authorizing'?'请在浏览器弹窗中允许访问。':busy==='opening'?'正在打开平台页面…':'正在检查当前浏览器中的平台页面，请稍候…'}:base;
     const badge=item.querySelector('[data-role="state"]');badge.textContent=connectionNames[c.kind]||'需要检查';badge.className=`badge ${['public','connected'].includes(c.kind)?'good':busy?'running':['not_granted','need_page','waiting_login'].includes(c.kind)?'':'warn'}`;
-    const message=item.querySelector('[data-role="message"]');message.textContent=c.message;message.hidden=item.classList.contains('compact')&&['public','connected','not_granted'].includes(c.kind);
+    const message=item.querySelector('[data-role="message"]');message.textContent=c.message;message.hidden=item.classList.contains('compact')&&(['public','connected','not_granted'].includes(c.kind)||(p!==primary()&&['need_page','waiting_login'].includes(c.kind)));
     const checked=item.querySelector('[data-role="checked"]');checked.textContent=!busy&&base.checkedAt?`${new Date(base.checkedAt).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',second:'2-digit'})} 已检测`:'';
     const button=item.querySelector('[data-role="action"]');button.disabled=!!busy;button.textContent=busy?busy==='authorizing'?'等待授权…':busy==='opening'?'正在打开…':'检测中…':nextConnectionAction(base.kind,p).label;
     item.setAttribute('aria-busy',String(!!busy));
@@ -203,10 +210,10 @@ function renderTable(){
   for(const row of shown.rows){
     const tr=node('tr');tr.dataset.rowId=row.id;tr.classList.toggle('row-reading',row.status==='running');tr.tabIndex=0;tr.setAttribute('aria-label',`查看 @${row.handle} 的资料`);
     for(const c of columns){const value=row.result?.[c.key]??'',td=node('td');td.title=String(value);
-      if(['followers','median','average','instagramFollowers','youtubeSubscribers'].includes(c.key))td.classList.add('numeric');
+      if(['followers','median','average','tiktokFollowers','instagramFollowers','youtubeSubscribers'].includes(c.key))td.classList.add('numeric');
       if(c.key==='youtubeSubscribers'&&row.youtubeApproximate&&!Object.hasOwn(row.overrides||{},c.key))td.title=`YouTube 页面公开值：${row.youtubeDisplay||fieldText(c.key,value)}（缩略精度）`;
       if(['median','average'].includes(c.key))td.title=`${statsLabel(shown.config)}；${row.preview?.count||0} 条样本`;
-      if(c.key==='url'){const a=node('a',row.url);a.href=row.url;a.target='_blank';a.rel='noopener noreferrer';a.addEventListener('click',e=>e.stopPropagation());td.append(a);}
+      if(c.key==='url'||c.key.endsWith('Url')){const a=node('a',value);a.href=value||'#';a.target='_blank';a.rel='noopener noreferrer';a.addEventListener('click',e=>e.stopPropagation());td.append(a);}
             else if(value===''&&!row.exhausted&&!Object.hasOwn(row.overrides||{},c.key)&&['median','average'].includes(c.key)&&row.preview?.[c.key]!=null){td.append(node('span',String(row.preview[c.key])),node('span','未完成','preview-label'));}
       else td.append(node('span',c.key==='gender'?fieldText(c.key,value):value===''?'—':fieldText(c.key,value)));
       tr.append(td);
@@ -223,9 +230,9 @@ function refreshImport(){
   try{
     const rows=parseClipboard($('batch').value),seen=new Set();
     for(const [index,row] of rows.entries())for(const cell of row.filter(s=>s.trim())){
-      const profile=normalizeProfile(cell.trim());
-      if(!profile)throw new Error(`第 ${index+1} 行不是 TikTok 主页链接。这里只需粘贴链接，其他信息转换后再填。`);
-      if(!seen.has(profile.handle.toLowerCase())){seen.add(profile.handle.toLowerCase());pasteEntries.push({...blankEntry(),url:profile.url});}
+      const profile=creator(cell.trim());
+      if(!profile)throw new Error(`第 ${index+1} 行不是 ${PLATFORMS[primary()].name} 主页链接。这里只需粘贴链接，其他信息转换后再填。`);
+      if(!seen.has(creatorKey(profile))){seen.add(creatorKey(profile));pasteEntries.push({...blankEntry(),url:profile.url});}
     }
   }catch(e){error=e.message;pasteEntries=[];}
   $('import-errors').hidden=!error;$('import-errors').textContent=error;$('batch').setAttribute('aria-invalid',String(!!error));
@@ -233,37 +240,8 @@ function refreshImport(){
 }
 function openImport(value=''){$('batch').value=typeof value==='string'?value:'';refreshImport();showDialog('import-dialog');$('batch').focus();}
 async function saveConfig(){await send('CONFIG',{config:readStatsControls()});}
-let preparedUpdate=null,updateCheckPending=false;
-function renderUpdate(){
-  const version=chrome.runtime.getManifest().version;
-  $('app-version').textContent=`v${version}`;
-  $('help-version').textContent=`当前版本 ${version}`;
-  $('update-ready').hidden=false;
-  $('help-open').hidden=false;
-  $('apply-update').textContent=preparedUpdate?.available?'应用更新':'检查更新';
-  if(!preparedUpdate?.available){$('apply-update').disabled=false;$('apply-update').title='检查本地已准备的新版';return;}
-  const running=state?.run.status==='running';
-  $('update-message').textContent=`${preparedUpdate.version} 已就绪${running?'，暂停采集后可应用。':'，应用后自动回到工作台。'}`;
-  $('apply-update').disabled=running;
-  $('apply-update').title=$('update-message').textContent;
-}
-async function checkUpdate(){
-  if(updateCheckPending)return;updateCheckPending=true;
-  try{const reply=await chrome.runtime.sendMessage({type:'UPDATE_STATUS'});if(reply?.ok)preparedUpdate=reply.data;renderUpdate();}catch{}finally{updateCheckPending=false;}
-}
-$('help-open').addEventListener('click',()=>{renderUpdate();showDialog('help-dialog');void checkUpdate();});
-action($('apply-update'),async()=>{
-  await checkUpdate();
-  if(!preparedUpdate?.available){toast(`当前 v${chrome.runtime.getManifest().version}，未发现已准备的新版。下载并运行新版包的“安装或更新”后，再点击此按钮。`);return;}
-  if(state?.run.status==='running')throw new Error('请先暂停采集，再应用更新。');
-  clearTimeout(draftTimer);await send('DRAFT',{draft:draft()});await saveConfig();
-  const reply=await chrome.runtime.sendMessage({type:'APPLY_UPDATE'});if(!reply?.ok)throw new Error(reply?.error||'更新未能应用，请重试。');
-  $('update-message').textContent='正在应用更新，工作台将自动重新打开…';
-});
-window.addEventListener('focus',()=>void checkUpdate());
-chrome.storage.onChanged.addListener(()=>renderUpdate());
-setInterval(()=>void checkUpdate(),10000);
-void checkUpdate();
+let versionUI;
+function renderUpdate(){versionUI?.render();}
 async function start(fromInput=false){
   clearTimeout(draftTimer);
   if(fromInput){
@@ -272,7 +250,7 @@ async function start(fromInput=false){
     await send('START',{rows:result.rows,draft:draft(),config:readStatsControls()});
   }else await send('START');
   showPage('results');
-  if(state.run.status==='blocked'&&state.connections.tiktok.kind==='not_granted')showDialog('connection-dialog');
+  if(state.run.status==='blocked'&&state.connections[primary()].kind==='not_granted')showDialog('connection-dialog');
 }
 function renderColumns(){
   $('column-list').replaceChildren();columnDraft.forEach((c,index)=>{
@@ -280,15 +258,31 @@ function renderColumns(){
     const grip=node('span',undefined,'drag-handle');grip.innerHTML='<svg viewBox="0 0 16 20" fill="currentColor"><circle cx="5" cy="5" r="1"/><circle cx="11" cy="5" r="1"/><circle cx="5" cy="10" r="1"/><circle cx="11" cy="10" r="1"/><circle cx="5" cy="15" r="1"/><circle cx="11" cy="15" r="1"/></svg>';
     const label=node('label'),check=node('input');check.type='checkbox';check.checked=c.visible;check.addEventListener('change',()=>c.visible=check.checked);label.append(check,node('span',c.label));item.append(grip,label);
     for(const [step,name,path] of [[-1,'上移','m4 9 4-4 4 4'],[1,'下移','m4 5 4 4 4-4']]){const button=node('button',undefined,'column-move');button.type='button';button.setAttribute('aria-label',`${name}${c.label}`);button.disabled=index+step<0||index+step>=columnDraft.length;button.innerHTML=`<svg viewBox="0 0 16 14" fill="none"><path d="${path}" stroke="currentColor" stroke-width="1.5"/></svg>`;button.addEventListener('click',()=>{[columnDraft[index],columnDraft[index+step]]=[columnDraft[index+step],columnDraft[index]];renderColumns();$('column-list').children[index+step].querySelector(`button[aria-label^="${name}"]`)?.focus();});item.append(button);}
-    item.addEventListener('dragstart',()=>{dragged=index;item.classList.add('dragging');});item.addEventListener('dragend',()=>item.classList.remove('dragging'));item.addEventListener('dragover',e=>e.preventDefault());item.addEventListener('drop',e=>{e.preventDefault();if(dragged===null)return;const [moved]=columnDraft.splice(dragged,1);columnDraft.splice(index,0,moved);dragged=null;renderColumns();});$('column-list').append(item);
+    item.dataset.key=c.key;
+    item.addEventListener('dragstart',e=>{dragged=c.key;columnDragSession={before:structuredClone(columnDraft)};e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',c.key);item.classList.add('dragging');});
+    item.addEventListener('dragend',()=>finishColumnDrag(false));
+    item.addEventListener('dragover',e=>{e.preventDefault();if(dragged===null||dragged===c.key)return;
+      const list=$('column-list'),source=[...list.children].find(n=>n.dataset.key===dragged),rect=item.getBoundingClientRect(),after=e.clientY>rect.top+rect.height/2;
+      const oldIndex=columnDraft.findIndex(x=>x.key===dragged),target=columnDraft.findIndex(x=>x.key===c.key)+(after?1:0),nextIndex=target-(oldIndex<target?1:0);if(oldIndex===nextIndex)return;
+      const positions=new Map([...list.children].map(n=>[n,n.getBoundingClientRect().top]));
+      const [moved]=columnDraft.splice(oldIndex,1);columnDraft.splice(nextIndex,0,moved);if(after)item.after(source);else item.before(source);
+      if(!matchMedia('(prefers-reduced-motion: reduce)').matches)for(const child of list.children){if(child===source)continue;const dy=positions.get(child)-child.getBoundingClientRect().top;if(dy){child.getAnimations().forEach(a=>a.cancel());child.animate([{transform:`translateY(${dy}px)`},{transform:'translateY(0)'}],{duration:340,easing:'cubic-bezier(.22,1.24,.36,1)'});}}
+    });
+    item.addEventListener('drop',e=>{e.preventDefault();finishColumnDrag(true);});$('column-list').append(item);
   });
 }
-function openRow(id){
-  const shown=resultState(),row=shown.rows.find(r=>r.id===id);if(!row)return;editingId=id;editOriginal={...row.result};$('row-title').textContent=`@${row.handle}`;$('row-status').textContent=rowDisplayStatus(row);$('row-notice').textContent=row.note;$('row-instagram').value=row.instagram||'';$('row-youtube').value=row.youtube||'';
-  $('row-fields').replaceChildren();for(const field of FIELDS){const wrap=node('div'),label=node('label',field.label),input=node(field.key==='brandLinks'?'textarea':'input');input.id=`edit-${field.key}`;input.value=field.key==='gender'?fieldText('gender',row.result?.gender):String(row.result?.[field.key]??'');input.readOnly=!!historyView;if(field.key==='gender')input.title=row.profile.genderEvidence?`本人公开自述：${row.profile.genderEvidence}`:'未读取到明确的本人声明，可人工填写。';label.htmlFor=input.id;if(['median','average','followers','instagramFollowers','youtubeSubscribers'].includes(field.key))input.inputMode='decimal';wrap.append(label,input);$('row-fields').append(wrap);}
-  for(const name of ['retry-row','save-row','read-instagram','read-youtube'])$(name).hidden=!!historyView;$('row-instagram').readOnly=!!historyView;$('row-youtube').readOnly=!!historyView;
-  $('retry-row').disabled=state.run.status==='running';renderInstagramStatus(row);renderYouTubeStatus(row);renderAudit(row);renderLinks(row);showDialog('row-dialog');
+function finishColumnDrag(commit){
+  if(!columnDragSession)return;
+  if(!commit)columnDraft=columnDragSession.before;
+  columnDragSession=null;dragged=null;renderColumns();
 }
+function openRow(id){
+  const shown=resultState(),row=shown.rows.find(r=>r.id===id);if(!row)return;editingId=id;editOriginal={...row.result};$('row-title').textContent=`@${row.handle}`;renderAIStatus(row);$('row-status').textContent=rowDisplayStatus(row);$('row-notice').textContent=row.note;$('row-instagram').value=row.instagram||'';$('row-youtube').value=row.youtube||'';
+  $('row-fields').replaceChildren();for(const field of activeFields()){const wrap=node('div'),label=node('label',field.label),input=node(field.key==='brandLinks'?'textarea':'input');input.id=`edit-${field.key}`;input.value=field.key==='gender'?fieldText('gender',row.result?.gender):String(row.result?.[field.key]??'');input.readOnly=!!historyView;if(field.key==='gender')input.title=row.profile.genderEvidence?`本人公开自述：${row.profile.genderEvidence}`:'未读取到明确的本人声明，可人工填写。';label.htmlFor=input.id;if(['median','average','followers','instagramFollowers','youtubeSubscribers'].includes(field.key))input.inputMode='decimal';wrap.append(label,input);$('row-fields').append(wrap);}
+  for(const name of ['retry-row','save-row','read-instagram','read-youtube'])$(name).hidden=!!historyView;$('row-instagram').readOnly=!!historyView;$('row-youtube').readOnly=!!historyView;
+  $('retry-row').disabled=state.run.status==='running';renderInstagramStatus(row);renderYouTubeStatus(row);renderAIStatus(row);renderAudit(row);renderLinks(row);showDialog('row-dialog');
+}
+function renderAIStatus(row){const el=$('row-ai-status');el.textContent=row.aiStatus?.note||'';el.hidden=!el.textContent;}
 function renderInstagramStatus(row){
   const el=$('instagram-read-status');if(!el)return;
   el.textContent=row.instagramRead?.note||(row.instagramFollowers!=null?'Instagram粉丝量已填写或读取。':row.instagram?'已发现关联Instagram账号，粉丝量为选填。':'');el.hidden=!el.textContent;
@@ -318,7 +312,7 @@ function renderLinks(row){
   const shown=resultState(),grouped=matchBrands(row.videos||[],keywords(shown.config.brands),row.capturedAt||shown.run.now||Date.now());$('row-links').replaceChildren();
   for(const [brand,links] of Object.entries(grouped)){if(!links.length)continue;$('row-links').append(node('h3',`${brand}${rangeComplete(row,180)?'':' · 已读取的部分视频'}`));for(const link of links){const a=node('a',link);a.href=link;a.target='_blank';a.rel='noopener noreferrer';$('row-links').append(a);}}
 }
-function readStatsControls(){return {statsMode:$('stats-unit').value,statsDays:Number($('stats-days').value),statsCount:Number($('stats-count').value),brands:$('brands').value};}
+function readStatsControls(){return {sourcePlatform:primary(),statsMode:$('stats-unit').value,statsDays:Number($('stats-days').value),statsCount:Number($('stats-count').value),brands:$('brands').value};}
 function syncStatsControls(config){$('stats-unit').value=config.statsMode||'days';$('stats-days').value=config.statsDays??30;$('stats-count').value=config.statsCount??5;renderRangeHint();}
 function renderRangeHint(){
   const config=readStatsControls(),videos=config.statsMode==='videos',value=videos?config.statsCount:config.statsDays;
@@ -328,7 +322,7 @@ function renderRangeHint(){
 }
 for(const button of $('stats-presets').querySelectorAll('button'))action(button,async()=>{const [mode,value]=button.dataset.statsPreset.split(':');$('stats-unit').value=mode;$(mode==='days'?'stats-days':'stats-count').value=value;renderRangeHint();await saveConfig();});
 for(const id of ['brands','stats-days','stats-count'])$(id).addEventListener('input',renderRangeHint);
-for(const n of document.querySelectorAll('[data-page]'))n.addEventListener('click',()=>{if(n.dataset.page==='history'){historyView=null;render();showPage('history');}else if(n.id==='current-nav')goCurrent();else {historyView=null;render();showPage(n.dataset.page);}});
+for(const n of document.querySelectorAll('[data-page]'))n.addEventListener('click',()=>{if(n.dataset.page==='history'){historyPlatform=primary();historyView=null;render();showPage('history');}else if(n.id==='current-nav')goCurrent();else {historyView=null;render();showPage(n.dataset.page);}});
 for(const n of document.querySelectorAll('[data-close]'))n.addEventListener('click',()=>$(n.dataset.close).close());
 $('connection-open').addEventListener('click',()=>{showDialog('connection-dialog');queueConnectionCheck();});
 for(const id of ['empty-add'])$(id).addEventListener('click',()=>showPage('input'));
@@ -337,20 +331,20 @@ $('add-entry').addEventListener('click',()=>{entries.push(blankEntry());renderEn
 $('open-table-import').addEventListener('click',()=>openImport());
 $('batch').addEventListener('input',refreshImport);
 for(const id of ['brands','stats-days','stats-count','stats-unit'])$(id).addEventListener('change',()=>{renderRangeHint();saveConfig().catch(e=>toast(e.message));});
-action($('confirm-import'),async()=>{refreshImport();if(!pasteEntries.length)return;entries=entries.filter(e=>entryKeys.some(k=>String(e[k]||'').trim()));const seen=new Set(entries.map(e=>normalizeProfile(e.url)?.handle.toLowerCase()).filter(Boolean));const incoming=pasteEntries.filter(e=>!seen.has(normalizeProfile(e.url).handle.toLowerCase()));entries.push(...incoming);renderEntries();clearTimeout(draftTimer);await send('DRAFT',{draft:draft()});$('import-dialog').close();toast(incoming.length?`已转换 ${incoming.length} 行，可逐行补充选填信息。`:'这些主页已在录入区，已有信息已保留。');});
+action($('confirm-import'),async()=>{refreshImport();if(!pasteEntries.length)return;entries=entries.filter(e=>entryKeys.some(k=>String(e[k]||'').trim()));const seen=new Set(entries.map(e=>creator(e.url)).filter(Boolean).map(creatorKey).filter(Boolean));const incoming=pasteEntries.filter(e=>!seen.has(creatorKey(creator(e.url))));entries.push(...incoming);renderEntries();clearTimeout(draftTimer);await send('DRAFT',{draft:draft()});$('import-dialog').close();toast(incoming.length?`已转换 ${incoming.length} 行，可逐行补充选填信息。`:'这些主页已在录入区，已有信息已保留。');});
 action($('start'),()=>start(true));
 action($('run-toggle'),async()=>{if(state.run.status==='running')await send('PAUSE');else await start();});
 action($('clear'),()=>nextBatch());
 action($('reuse-history'),()=>nextBatch(historyView.id));
 for(const id of ['return-current','history-current'])$(id).addEventListener('click',goCurrent);
 action($('copy'),async()=>{const shown=resultState();if(shown.rows.some(r=>r.status!=='complete')&&!confirm('有未完成或需检查的达人。继续复制？已完成的播放统计会保留，未完成的字段留空。'))return;const columns=outputColumns(shown);await navigator.clipboard.writeText(toTSV(shown.rows.map(r=>r.result),columns,$('with-header').checked));toast(`已复制 ${shown.rows.length} 行，可直接粘贴到表格。`);});
-$('columns-open').addEventListener('click',()=>{columnDraft=structuredClone(state.columns);renderColumns();showDialog('columns-dialog');});
+$('columns-open').addEventListener('click',()=>{columnDraft=structuredClone(selectColumns(state.columns,FIELDS,primary()));renderColumns();showDialog('columns-dialog');});
 action($('save-columns'),async()=>{if(!columnDraft.some(c=>c.visible))throw new Error('请至少保留一列。');await send('COLUMNS',{columns:columnDraft});$('columns-dialog').close();});
 for(const item of document.querySelectorAll('[data-platform]'))item.querySelector('[data-role="action"]').addEventListener('click',()=>void connectPlatform(item.dataset.platform));
 window.addEventListener('focus',queueConnectionCheck);
 document.addEventListener('visibilitychange',queueConnectionCheck);
 chrome.tabs.onActivated.addListener(({tabId})=>{chrome.tabs.getCurrent().then(tab=>{if(tab?.id===tabId)queueConnectionCheck();}).catch(()=>{});});
-action($('save-row'),async()=>{await send('SET_YOUTUBE',{id:editingId,value:$('row-youtube').value});for(const f of FIELDS){const value=$(`edit-${f.key}`).value;if(value!==String(editOriginal[f.key]??''))await send('EDIT',{id:editingId,key:f.key,value});}await send('SET_INSTAGRAM',{id:editingId,value:$('row-instagram').value});$('row-dialog').close();toast('修改已保存。');});
+action($('save-row'),async()=>{await send('SET_YOUTUBE',{id:editingId,value:$('row-youtube').value});for(const f of activeFields()){const value=$(`edit-${f.key}`).value;if(value!==String(editOriginal[f.key]??''))await send('EDIT',{id:editingId,key:f.key,value});}await send('SET_INSTAGRAM',{id:editingId,value:$('row-instagram').value});$('row-dialog').close();toast('修改已保存。');});
 action($('retry-row'),async()=>{const id=editingId;$('row-dialog').close();historyView=null;showPage('results');await send('RETRY',{id});});
 action($('read-instagram'),async()=>{await send('SET_INSTAGRAM',{id:editingId,value:$('row-instagram').value});if(state.connections.instagram.kind==='not_granted'){showDialog('connection-dialog');toast('先允许访问 Instagram，再返回达人详情读取。');return;}await send('READ_INSTAGRAM',{id:editingId});toast('Instagram粉丝量正在后台读取。');});
 action($('read-youtube'),async()=>{await send('SET_YOUTUBE',{id:editingId,value:$('row-youtube').value});if(state.connections.youtube.kind==='not_granted'){showDialog('connection-dialog');toast('先允许访问 YouTube，再返回达人详情读取。');return;}await send('READ_YOUTUBE',{id:editingId});toast('YouTube 订阅数正在后台读取。');});
@@ -363,4 +357,56 @@ action($('copy-diagnostic'),()=>copyDiagnostic(editingId));
 action($('status-diagnostic'),()=>copyDiagnostic(statusRowId));
 $('status-detail').addEventListener('click',()=>{$('status-dialog').close();openRow(statusRowId);});
 chrome.storage.onChanged.addListener((changes,area)=>{if(area==='local'&&changes[STORE]?.newValue){state=changes[STORE].newValue;render();}});
+function renderSourceTabs(){
+  const selected=displayedPlatform(),running=state?.run.status==='running'&&currentPage!=='history';
+  for(const b of document.querySelectorAll('[data-source]')){b.classList.toggle('active',b.dataset.source===selected);b.setAttribute('aria-selected',String(b.dataset.source===selected));b.tabIndex=b.dataset.source===selected?0:-1;b.disabled=running;}
+  for(const p of Object.keys(PLATFORMS))document.body.classList.toggle(`source-${p}`,primary()===p);
+  $('history-current').hidden=currentPage!=='history';
+  $('entry-url-label').textContent=`${PLATFORMS[primary()].name} ${primary()==='youtube'?'频道':'主页'} URL`;
+  $('import-description').textContent=`每行一个 ${PLATFORMS[primary()].name} 主页链接，无需表头。其他信息转换后再填。`;
+  $('batch').placeholder=Array.from({length:3},(_,i)=>PLATFORMS[primary()].placeholder.replace('username',`username${i+1}`)).join('\n');
+  for(const el of document.querySelectorAll('.side-card [data-platform] h3 .muted'))el.hidden=true;
+}
+for(const button of document.querySelectorAll('[data-source]'))action(button,async()=>{
+  const platform=button.dataset.source;
+  if(currentPage==='history'){historyPlatform=platform;renderSourceTabs();renderHistory();return;}
+  if(platform===primary()&&!historyView)return;
+  clearTimeout(draftTimer);await send('DRAFT',{draft:draft()});await send('SOURCE',{platform});
+  historyView=null;historyLoadId++;syncDraft();showPage('input');render();
+});
+$('platform-tabs').addEventListener('keydown',event=>{
+  if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
+  const buttons=[...$('platform-tabs').querySelectorAll('button')];if(buttons.some(b=>b.disabled))return;
+  event.preventDefault();let index=buttons.indexOf(document.activeElement);
+  index=event.key==='Home'?0:event.key==='End'?buttons.length-1:(index+(event.key==='ArrowRight'?1:-1)+buttons.length)%buttons.length;
+  buttons[index].focus();buttons[index].click();
+});
+attachColumnAutoScroll($('columns-dialog'),()=>dragged!==null);
+$('columns-dialog').addEventListener('close',()=>finishColumnDrag(false));
+$('column-list').addEventListener('drop',event=>{if(dragged!==null){event.preventDefault();finishColumnDrag(true);}});
+window.addEventListener('blur',()=>finishColumnDrag(false));
+async function rawMessage(type,extra={}){const reply=await chrome.runtime.sendMessage({type,...extra});if(!reply?.ok)throw new Error(reply?.error||'操作未完成，请重试。');return reply.data;}
+action($('ai-open'),async()=>{
+  const settings=await rawMessage('AI_GET');
+  $('ai-enabled').checked=!!settings.enabled;$('ai-endpoint').value=settings.endpoint||'';$('ai-model').value=settings.model||'';
+  $('ai-key').value='';$('ai-key').placeholder=settings.hasKey?'已保存；留空保留原密钥':'仅保存在本机当前 Chrome 用户中';$('ai-clear-key').checked=false;
+  $('ai-gender').checked=settings.genderDeclaration!==false;$('ai-feedback').hidden=true;showDialog('ai-dialog');
+  $('ai-images').checked=settings.useImages!==false;
+});
+async function saveAI(test=false){
+  const feedback=$('ai-feedback');feedback.hidden=false;feedback.classList.remove('error');
+  try{
+    const config=validateAIConfig({enabled:$('ai-enabled').checked,endpoint:$('ai-endpoint').value,model:$('ai-model').value,useImages:$('ai-images').checked,genderDeclaration:$('ai-gender').checked});
+    if(config.endpoint){
+      const granted=await chrome.permissions.request({origins:[new URL(config.endpoint).origin+'/*',...(config.useImages?IMAGE_ORIGINS:[])]});
+      if(!granted)throw new Error('未允许访问 AI 接口。设置未保存，可以重新点击保存授权。');
+    }
+    const key=$('ai-clear-key').checked?'':$('ai-key').value||undefined;
+    await send('AI_SAVE',{config,...(key===undefined?{}:{key})});$('ai-key').value='';
+    if(test){feedback.textContent='正在用测试文本检查接口与模型…';await rawMessage('AI_TEST');feedback.textContent='连接成功，接口与模型可用。';}
+    else{$('ai-dialog').close();toast(config.enabled?'AI 辅助已开启，基础数据完成后自动分析。':'AI 设置已保存，继续使用本地规则。');}
+  }catch(error){feedback.classList.add('error');feedback.textContent=error.message;}
+}
+action($('ai-save'),()=>saveAI());action($('ai-test'),()=>saveAI(true));
+versionUI=setupVersionUpdates({sendRaw:rawMessage,saveInput:async()=>{clearTimeout(draftTimer);await send('DRAFT',{draft:draft()});if(currentPage==='input')await saveConfig();},getRunStatus:()=>state?.run.status,onError:toast,openHelp:()=>showDialog('help-dialog')});
 try{await send('GET');const d=state.draft||{};entries=Array.isArray(d.entries)?d.entries.map(e=>({...blankEntry(),...e})):d.url?[Object.fromEntries(entryKeys.map(k=>[k,d[k]||'']))]:[blankEntry()];renderEntries();if(!d.entries&&d.batch)openImport(d.batch);$('brands').value=state.config.brands;syncStatsControls(state.config);showPage(state.flow==='results'&&state.rows.length?'results':'input');render();queueConnectionCheck();}catch(e){toast(e.message);}

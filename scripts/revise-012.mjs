@@ -1,0 +1,15 @@
+import {readFile,writeFile} from 'node:fs/promises';
+for(const name of ['package.json','package-lock.json','extension/manifest.json'])await writeFile(name,(await readFile(name,'utf8')).replaceAll('0.1.1','0.1.2'));
+let name='extension/app.html',s=await readFile(name,'utf8');
+s=s.replace('检查粘贴内容','从表格导入').replace('确认每一列对应的信息，联系方式会跟随原行。','复制整块表格并粘贴，确认列对应关系后填入录入区。');
+s=s.replace('<div class="dialog-body"><label class="checkbox block"><input id="mapping-header"','<div class="dialog-body"><label for="batch">粘贴表格内容</label><textarea id="batch" rows="3" spellcheck="false" placeholder="在 Excel 中选中主页和联系方式等列，复制后粘贴到这里"></textarea><label class="checkbox block import-header"><input id="mapping-header"');
+await writeFile(name,s);
+name='tests/browser.mjs';s=await readFile(name,'utf8');
+s=s.replace("await real.page.locator('#batch').fill", "await real.page.locator('#open-table-import').click();await real.page.locator('#batch').fill");
+s=s.replace("await real.page.locator('#preview-import').click();assert.equal(await real.page.locator('#confirm-import').innerText(),'加入 2 位达人');", "assert.equal(await real.page.locator('#confirm-import').innerText(),'填入 2 行');");
+s=s.replace("await real.page.locator('#confirm-import').click();", "await real.page.locator('#confirm-import').click();await real.page.locator('#preview-import').click();");await writeFile(name,s);
+name='tests/connections.mjs';s=(await readFile(name,'utf8')).replaceAll('revision-0.1.1','revision-0.1.2');
+const start=s.indexOf("    await app.locator('#mode-single').click();"),end=s.indexOf('\n  }',start);
+if(start>=0)s=s.slice(0,start)+"    assert.equal(await app.locator('#entry-body tr').count(),1);"+s.slice(end);await writeFile(name,s);
+name='tests/package-check.mjs';s=(await readFile(name,'utf8')).replace("await reader.locator('#batch').click();", "await reader.locator('#open-table-import').click();await reader.locator('#batch').click();");await writeFile(name,s);
+name='tests/upgrade-check.mjs';s=(await readFile(name,'utf8')).replace('artifacts/revision-0.1.1/upgrade-check.json','artifacts/revision-${version}/upgrade-check.json');await writeFile(name,s);

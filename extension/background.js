@@ -1,5 +1,11 @@
 import {FIELDS, resultFor, normalizeInstagram, normalizeYouTube, normalizeProfile, statistics, mergeVideos, keywords, collectionDays, rangeComplete, statsComplete, collectionComplete, statsLabel, normalizeStatsConfig} from './lib/core.js';
 import {batchKey,batchPersistence} from './lib/batches.js';
+import {sourcePlatform,normalizeCreator,creatorKey,discoverAccounts,fieldsFor} from './lib/platforms.js';
+import {mergePlatformVideos,updatePlatformCoverage} from './lib/multi-state.js';
+import {validateAIConfig,aiEvidence,requestAI,prepareAIImages} from './lib/ai.js';
+import './lib/page-data.js';
+import {UpdateController} from './lib/update-controller.js';
+import {CHECK_INTERVAL} from './lib/github-updates.js';
 import './lib/timeline.js';
 // Release files stay in their versioned directory until Chrome applies an update.
 const ASSETS=new URL('./',import.meta.url).pathname.slice(1);
@@ -9,6 +15,9 @@ const ORIGINS={tiktok:['https://*.tiktok.com/*'],instagram:['https://*.instagram
 const PLATFORM_NAMES={tiktok:'TikTok',instagram:'Instagram',youtube:'YouTube'};
 let state;let lock=Promise.resolve();let lastProgressSave=0;
 let directTimer,directBusy=null,instagramTimer,youtubeTimer;
+let multiTimer,multiBusy=null,aiTimer,aiBusy=null;
+const primary=()=>sourcePlatform(state.config);
+const githubUpdates=new UpdateController();
 const serialize=fn=>{const p=lock.then(fn);lock=p.catch(()=>{});return p;};
 function initial(){return {version:1,rows:[],config:{brands:'',statsDays:30},columns:FIELDS.map(x=>({...x,visible:true})),draft:{mode:'batch',batch:'',url:'',contact:'',instagram:'',instagramFollowers:''},connections:{tiktok:{kind:'not_granted',message:'尚未允许读取 TikTok。'},instagram:{kind:'not_granted',message:'需要读取 Instagram 时再连接。'}},run:{status:'idle',now:null,index:null,tabId:null,token:null,lastReceived:null},notice:''};}
 const ready=(async()=>{
@@ -21,6 +30,8 @@ const ready=(async()=>{
   if(!state.columns.some(c=>c.visible))state.columns[0].visible=true;
   state.instagramQueue??=[];
   state.youtubeQueue??=[];
+  state.ai??={enabled:false};state.aiQueue??=[];
+  for(const row of state.rows)row.platform??='tiktok';
   // Repair only the old IG-only incomplete state when TikTok itself is complete.
   for(const row of state.rows){
     const stats=statistics(row.videos||[],state.config,row.capturedAt||Date.now());
@@ -32,11 +43,13 @@ const ready=(async()=>{
   await save();
   if(state.instagramPending||state.instagramQueue.length)scheduleInstagram();
   if(state.youtubePending||state.youtubeQueue.length)scheduleYouTube();
+  if(state.aiQueue.length)scheduleAI();
 })();
 async function save(){const batches=batchPersistence(state);await chrome.storage.local.set({[STORE]:state,...batches});lastProgressSave=Date.now();}
 async function newBatch(source=null){
   if(state.run.status==='running')throw new Error('请先暂停当前批次，再开始下一批。');
-  await save();await stopCollector();await parkCollector();
+  for(const row of state.rows)if(['queued','reading'].includes(row.aiStatus?.status))row.aiStatus={status:'stopped',note:'本批 AI 分析已停止，已保留基础数据和已有分类。'};
+  await save();await stopCollector();await parkCollector();state.aiQueue=[];
   await cancelYouTube();clearTimeout(instagramTimer);state.rows=[];state.batch=null;state.flow='input';state.run={status:'idle',now:null,index:null,tabId:null,token:null};state.instagramPending=null;state.instagramQueue=[];
   state.draft={entries:source?source.rows.map(r=>({url:r.url,contact:r.contact||'',instagram:r.instagram||'',instagramFollowers:r.instagramFollowers??'',youtube:r.youtube||'',youtubeSubscribers:r.youtubeSubscribers??''})):[],forceFresh:!!source};
   if(source)state.config={...source.config};
@@ -49,7 +62,7 @@ function register(platform){
   registrations.set(platform,task);return task;
 }
 async function registerPlatform(platform){
-  const files=['lib/page-data.js','lib/video-data.js','lib/timeline.js','lib/youtube.js','collector.js'];
+  const files=['lib/page-data.js','lib/video-data.js','lib/timeline.js','lib/youtube.js',...(platform==='tiktok'?[]:['lib/platform-page.js']),'collector.js'];
   const specs=platform==='tiktok'?[{id:'kol-tiktok-observer',matches:ORIGINS.tiktok,js:['observer.js'],runAt:'document_start',world:'MAIN'},{id:'kol-tiktok-collector',matches:ORIGINS.tiktok,js:files,runAt:'document_start',world:'ISOLATED'}]:[{id:`kol-${platform}-collector`,matches:ORIGINS[platform],js:files,runAt:'document_start',world:'ISOLATED'}];
   for(const spec of specs)spec.js=spec.js.map(asset);
   const existing=await chrome.scripting.getRegisteredContentScripts();
@@ -108,6 +121,7 @@ async function pause(reason='任务已暂停，可稍后继续。',kind='paused'
   state.notice=reason;await save();
 }
 async function beginCurrent(){
+  if(state.run.mode==='multi-api'){scheduleMulti();return;}
   if(state.run.mode==='creator-api')return;
   const row=activeRow();if(!row)return;
   const tab=await chrome.tabs.get(state.run.tabId).catch(()=>null);
@@ -157,6 +171,7 @@ async function resumeRecovery(){
 }
 async function heartbeat(){
   if(state.run.status!=='running')return;
+  if(state.run.mode==='multi-api'){scheduleMulti();return;}
   if(state.run.mode==='creator-api'){scheduleDirect();return;}
   if(state.run.retryAt){await resumeRecovery();return;}
   const row=activeRow();if(!row)return;
@@ -233,6 +248,7 @@ async function next(){
   if(!row){state.run.status='finished';state.run.index=null;await parkCollector();state.notice=state.rows.some(r=>r.status!=='complete')?'本批已处理完毕，部分达人需要检查，请查看行内状态。':'';await save();return;}
   state.run={...state.run,status:'running',phase:'loading',mode:'page',index:row.id,token:crypto.randomUUID(),lastReceived:Date.now(),recoveries:0,retryAt:null};
   row.status='running';row.note='正在复用已有主页数据，或在后台读取首批响应。';row.stagnant=0;row.exhausted=false;row.paging=null;row.capturedAt??=Date.now();row.nativeReloads=0;row.dataErrorAt=null;row.hiddenAt=null;row.loadingAt=Date.now();
+  if(primary()!=='tiktok'){state.run.mode='multi-api';row.note='正在后台读取所选平台的账号资料与视频。';await save();scheduleMulti();return;}
   // Public data on a warm page can be displayed immediately. Unless its native
   // first-to-last page chain was observed, open an owned document for full data.
   try{
@@ -332,7 +348,7 @@ async function readDirectPage(){
 }
 async function start(){
   if(state.run.status==='running')return;
-  const connection=await check('tiktok');await save();
+  const connection=await check(primary());await save();
   if(!['connected','public','private','not_found'].includes(connection.kind)) {state.run.status='blocked';state.notice=connection.message;await save();return;}
   if(!state.run.now)state.run.now=Date.now();
   state.notice='';await stopCollector();await next();
@@ -343,7 +359,7 @@ async function finish(row,complete,note){
   row.result=resultFor(row,state.config,state.run.now);
   row.status=complete?'complete':'partial';row.note=note;
   state.run.index=null;state.run.token=null;
-  await save();await next();
+  await save();queueAI(row);if((row.platform||'tiktok')!=='tiktok')void enrichLinked(row.id,state.batch?.id);await next();
 }
 async function snapshot(message,sender){
   if(state.run.status!=='running'||state.run.retryAt||sender.tab?.id!==state.run.tabId||message.jobId!==state.run.index||message.token!==state.run.token)return {continue:false};
@@ -554,18 +570,136 @@ async function inspectYouTube(){
   }catch(error){if(Date.now()-pending.startedAt>=25000||pending.attempts>=15){await endYouTube(pending,row,'needs_attention',error.message);return;}}
   await save();scheduleYouTube(1000);
 }
-function validateRows(incoming){
+async function platformRequest(job){
+  if(!await allowed(job.platform))return {ok:false,kind:'permission',error:`请先授权 ${PLATFORM_NAMES[job.platform]}。`};
+  const tabs=(await platformTabs(job.platform)).filter(t=>!t.discarded&&new URL(t.url).hostname===`www.${job.platform==='instagram'?'instagram':job.platform==='youtube'?'youtube':'tiktok'}.com`);
+  let carrier=tabs.find(t=>t.id===state.connections[job.platform]?.tabId)||tabs[0],owned=false;
+  try{
+    if(!carrier){
+      carrier=await chrome.tabs.create({url:job.url,active:false});owned=true;
+      const end=Date.now()+15000;while(Date.now()<end){const tab=await chrome.tabs.get(carrier.id);if(tab.status==='complete')break;await new Promise(r=>setTimeout(r,180));}
+    }
+    await chrome.scripting.executeScript({target:{tabId:carrier.id},world:'ISOLATED',files:['lib/page-data.js','lib/youtube.js','lib/platform-page.js'].map(asset)});
+    const results=await deadline(chrome.scripting.executeScript({target:{tabId:carrier.id},world:'ISOLATED',func:async payload=>globalThis.KOLMultiReader.read(payload),args:[job]}),65000,'平台读取超时，已有结果已保留。');
+    let result=results[0]?.result||{ok:false,kind:'empty_response',error:'平台没有返回有效数据。'};
+    if(job.platform==='instagram'&&!owned&&!result.ok&&['api_unavailable','invalid_response'].includes(result.kind)){
+      // One ordinary navigation can return profile JSON that a background
+      // fetch did not receive. Only our own inactive tab is initialized.
+      await register('instagram');carrier=await chrome.tabs.create({url:job.url,active:false});owned=true;
+      const end=Date.now()+15000;while(Date.now()<end){const tab=await chrome.tabs.get(carrier.id);if(tab.status==='complete')break;await new Promise(r=>setTimeout(r,180));}
+      await chrome.scripting.executeScript({target:{tabId:carrier.id},world:'ISOLATED',files:['lib/page-data.js','lib/youtube.js','lib/platform-page.js'].map(asset)});
+      const retry=await deadline(chrome.scripting.executeScript({target:{tabId:carrier.id},world:'ISOLATED',func:async payload=>globalThis.KOLMultiReader.read(payload),args:[job]}),65000,'平台读取超时，已有结果已保留。');
+      result=retry[0]?.result||result;
+    }
+    return result;
+  }catch(error){return {ok:false,kind:'request_error',error:error.message};}
+  finally{if(owned&&carrier)await chrome.tabs.remove(carrier.id).catch(()=>{});}
+}
+function scheduleMulti(){
+  clearTimeout(multiTimer);
+  if(state.run.status!=='running'||state.run.mode!=='multi-api'||multiBusy?.token===state.run.token)return;
+  multiTimer=setTimeout(()=>void readMultiPage(),180);
+}
+async function readMultiPage(){
+  await ready;if(state.run.status!=='running'||state.run.mode!=='multi-api')return;
+  const row=activeRow();if(!row)return;
+  const job={token:state.run.token,id:row.id,batchId:state.batch?.id};
+  if(multiBusy?.token===job.token)return;multiBusy=job;
+  try{
+    const reply=await platformRequest({platform:row.platform,handle:row.handle,url:row.url,profile:structuredClone(row.profile),config:structuredClone(state.config),reader:row.reader?structuredClone(row.reader):null});
+    await serialize(async()=>{
+      if(state.run.status!=='running'||state.run.token!==job.token||state.batch?.id!==job.batchId||activeRow()?.id!==job.id)return;
+      const current=activeRow();
+      if(!reply.ok){
+        if(reply.data?.profile?.handle?.toLowerCase()===current.handle.toLowerCase()){current.profile={...current.profile,...reply.data.profile};current.result=resultFor(current,state.config,current.capturedAt);}
+        if(['login_required','challenge','permission'].includes(reply.kind)){await pause(reply.error,'blocked');return;}
+        current.outcome={kind:reply.kind,at:Date.now()};await finish(current,false,reply.error);return;
+      }
+      const data=reply.data;
+      if(!data?.profile||data.profile.handle&&data.profile.handle.toLowerCase()!==current.handle.toLowerCase()){await finish(current,false,'平台返回了其他账号资料，未采用该数据。');return;}
+      current.profile={...current.profile,...data.profile};
+      const accounts=discoverAccounts(current.profile);
+      current.tiktok||=accounts.tiktok||'';current.instagram||=normalizeInstagram(accounts.instagram);current.youtube||=accounts.youtube||'';
+      current.videos=mergePlatformVideos(current.videos,data.videos,current);
+      const complete=updatePlatformCoverage(current,data,state.config);
+      current.progressAt=Date.now();state.run.lastReceived=Date.now();
+      current.diagnostic={mode:'multi-api',platform:current.platform,pages:current.paging?.pages,visibility:'background',at:Date.now()};
+      current.result=resultFor(current,state.config,current.capturedAt);
+      if(complete){
+        const stats=statistics(current.videos,state.config,current.capturedAt),issues=[];
+        if(!current.profile.name)issues.push('没有取得博主名称');if(current.profile.followers==null)issues.push('平台未公开或未返回粉丝量/订阅数');
+        if(stats.missing||stats.unknownDates)issues.push('部分视频缺少日期或精确播放数，未输出完整均值');
+        await finish(current,!issues.length,issues.length?issues.join('；'):`${PLATFORM_NAMES[current.platform]} ${statsLabel(state.config)}播放统计已完成${keywords(state.config.brands).length?'；近180天关键词检索已完成':''}。`);return;
+      }
+      current.note=`后台读取 · 已取得 ${current.videos.length} 条作品 · ${statsLabel(state.config)}${keywords(state.config.brands).length?'，同时检索近180天关键词':''}。`;
+      await save();
+    });
+  }catch(error){await serialize(async()=>{if(state.run.token===job.token&&state.run.status==='running')await finish(activeRow(),false,error.message);});}
+  finally{if(multiBusy===job)multiBusy=null;scheduleMulti();}
+}
+async function enrichLinked(id,batchId){
+  const row=state.rows.find(r=>r.id===id);if(!row||state.batch?.id!==batchId)return;
+  const links=discoverAccounts(row.profile);links.tiktok=row.tiktok||links.tiktok;links.instagram=row.instagram?`https://www.instagram.com/${row.instagram}/`:links.instagram;links.youtube=row.youtube||links.youtube;
+  for(const platform of Object.keys(ORIGINS)){
+    if(platform===row.platform||!links[platform]||!await allowed(platform))continue;
+    const p=normalizeCreator(links[platform],platform);if(!p)continue;
+    const reply=await platformRequest({...p,profileOnly:true});
+    await serialize(async()=>{
+      if(state.batch?.id!==batchId||!state.rows.includes(row))return;
+      row.supplements??={};row.supplements[platform]={status:reply.ok?'complete':'needs_attention',note:reply.ok?'已补充关联平台的公开资料。':reply.error};
+      if(reply.ok){const key={tiktok:'tiktokFollowers',instagram:'instagramFollowers',youtube:'youtubeSubscribers'}[platform];if(!Object.hasOwn(row.overrides||{},key))row[key]=reply.data.profile.followers??null;}
+      row.result=resultFor(row,state.config,row.capturedAt);await save();
+    });
+  }
+}
+const AI_STORE='kolAISettingsV1';
+function scheduleAI(){clearTimeout(aiTimer);aiTimer=setTimeout(()=>void runAI(),250);}
+function queueAI(row){
+  if(!state.ai.enabled||!row?.profile?.name||!row.videos?.length)return;
+  const job={id:row.id,batchId:state.batch?.id,capturedAt:row.capturedAt,revision:state.ai.revision};
+  if(!state.aiQueue.some(j=>j.id===row.id&&j.batchId===job.batchId&&j.revision===job.revision)&&!(aiBusy?.id===row.id&&aiBusy?.revision===job.revision)){state.aiQueue.push(job);row.aiStatus={status:'queued',note:'AI 主题分析等待中，本地结果可先使用。'};scheduleAI();}
+}
+async function runAI(){
+  await ready;if(aiBusy||!state.ai.enabled)return;
+  const settings=(await chrome.storage.local.get(AI_STORE))[AI_STORE];if(!settings?.enabled)return;
+  let job,row;
+  await serialize(async()=>{
+    while(state.aiQueue.length){const candidate=state.aiQueue.shift();const found=state.rows.find(r=>r.id===candidate.id);if(found&&candidate.batchId===state.batch?.id&&found.capturedAt===candidate.capturedAt&&candidate.revision===state.ai.revision){job=candidate;row=found;break;}}
+    if(row){aiBusy=job;row.aiStatus={status:'reading',note:'AI 正在分析内容主题，本地结果已保留。'};await save();}
+  });if(!row)return;
+  try{
+    const origin=new URL(settings.endpoint).origin+'/*';
+    if(!await chrome.permissions.contains({origins:[origin]}))throw new Error('AI 接口访问权限已撤销，请到 AI 设置重新授权。');
+    const evidence=aiEvidence(row,state.config),pictures=settings.useImages?await prepareAIImages(row,evidence,{permitted:origin=>chrome.permissions.contains({origins:[origin]})}):{images:[],failures:[],requested:0};
+    // Do not send after the user changed settings or switched batches while
+    // public thumbnails were being read.
+    if(state.batch?.id!==job.batchId||row.capturedAt!==job.capturedAt||!state.ai.enabled||state.ai.revision!==job.revision)return;
+    const response=await requestAI(settings,settings.key,evidence,{signal:AbortSignal.timeout(25000),images:pictures.images});
+    await serialize(async()=>{
+      if(state.batch?.id!==job.batchId||!state.rows.includes(row)||row.capturedAt!==job.capturedAt||!state.ai.enabled||state.ai.revision!==job.revision)return;
+      let gender='',genderEvidence='';
+      if(settings.genderDeclaration&&response.genderQuote){const declared=globalThis.KOLPageData.declaredGender(response.genderQuote);gender=declared.gender;genderEvidence=declared.evidence;}
+      const imageCount=pictures.images.length;
+      row.aiResult={types:response.types,gender,genderEvidence,evidence:response.evidence,imageCount,imageFailures:pictures.failures,at:Date.now()};
+      const imageNote=settings.useImages?(imageCount?`使用 ${imageCount} 张视频封面/缩略图＋文字${pictures.failures.length?'，部分图片未读取':''}。`:'未取得可用图片，本次仅使用文字。'):'';
+      row.aiStatus={status:'complete',note:(response.types?'AI 已补充达人类型。':'AI 证据不足，保留本地规则结果。')+imageNote};
+      row.result=resultFor(row,state.config,row.capturedAt);await save();
+    });
+  }catch(error){await serialize(async()=>{if(state.batch?.id===job.batchId&&state.rows.includes(row)&&row.capturedAt===job.capturedAt&&state.ai.revision===job.revision){row.aiStatus={status:'needs_attention',note:error.name==='TimeoutError'?'AI 请求超时，本地结果已保留。':error.message};await save();}});}
+  finally{aiBusy=null;if(state.aiQueue.length)scheduleAI();}
+}
+function validateRows(incoming,platform=primary()){
   if(!Array.isArray(incoming))throw new Error('请输入一批博主主页。');
   const seen=new Set();
   return incoming.map(r=>{
-    const profile=normalizeProfile(r.url),contact=String(r.contact||'').trim(),ig=normalizeInstagram(r.instagram),youtube=normalizeYouTube(r.youtube);
-    if(!profile)throw new Error('包含无效的 TikTok 主页，请逐行检查。');
-    if(seen.has(profile.handle.toLowerCase()))throw new Error(`@${profile.handle} 重复，请合并为一行。`);
+    const profile=normalizeCreator(r.url,platform),contact=String(r.contact||'').trim(),ig=normalizeInstagram(r.instagram),youtube=normalizeYouTube(r.youtube);
+    if(!profile)throw new Error(`包含无效的 ${PLATFORM_NAMES[platform]} 主页，请逐行检查。`);
+    if(seen.has(creatorKey(profile)))throw new Error(`@${profile.handle} 重复，请合并为一行。`);
     if(r.instagram&&!ig)throw new Error(`@${profile.handle} 的 Instagram 账号无效。`);
     if(r.youtube&&!youtube)throw new Error(`@${profile.handle} 的 YouTube 频道链接无效。`);
     if(r.instagramFollowers!=null&&(!Number.isFinite(r.instagramFollowers)||r.instagramFollowers<0))throw new Error('Instagram 粉丝量无效。');
     if(r.youtubeSubscribers!=null&&r.youtubeSubscribers!==''&&(!Number.isFinite(r.youtubeSubscribers)||r.youtubeSubscribers<0))throw new Error('YouTube 订阅数无效。');
-    seen.add(profile.handle.toLowerCase());return {...profile,contact,instagram:ig,instagramFollowers:r.instagramFollowers??null,youtube,youtubeSubscribers:r.youtubeSubscribers===''?null:r.youtubeSubscribers??null};
+    seen.add(creatorKey(profile));return {...profile,contact,instagram:ig,instagramFollowers:r.instagramFollowers??null,youtube,youtubeSubscribers:r.youtubeSubscribers===''?null:r.youtubeSubscribers??null};
   });
 }
 function putRows(cleanRows){
@@ -587,6 +721,7 @@ async function dispatch(m,sender){
   if(m.type==='COLLECT_SNAPSHOT')return snapshot(m,sender);
   // Collection pages are allowed to submit data, never edit tasks or open arbitrary URLs.
   if(sender.url&&!sender.url.startsWith(chrome.runtime.getURL('')))throw new Error('不接受网页发起的管理操作。');
+  if(githubUpdates.installing&&['START','RETRY','NEW_BATCH','SOURCE','IMPORT','BATCH_FROM_HISTORY'].includes(m.type))throw new Error('正在应用更新，请等待完成后继续。');
   switch(m.type){
     case 'HISTORY_GET':{
       if(!state.history.some(b=>b.id===m.id))throw new Error('没有找到该批次。');
@@ -594,6 +729,30 @@ async function dispatch(m,sender){
       if(!snapshot)throw new Error('这条历史记录的结果尚未保存，请重试。');return snapshot;
     }
     case 'NEW_BATCH':return newBatch();
+    case 'SOURCE':{
+      if(!Object.hasOwn(ORIGINS,m.platform))throw new Error('未知平台。');
+      if(state.run.status==='running')throw new Error('请先暂停当前读取，再切换搜索平台。');
+      if(primary()===m.platform)return state;
+      state.platformDrafts??={};state.platformDrafts[primary()]=structuredClone(state.draft);
+      if(state.rows.length)await newBatch();
+      state.config={...state.config,sourcePlatform:m.platform};state.draft=state.platformDrafts[m.platform]||{entries:[]};state.flow='input';await save();return state;
+    }
+    case 'AI_GET':{
+      const settings=(await chrome.storage.local.get(AI_STORE))[AI_STORE]||{};
+      const {key,...publicSettings}=settings;return {...publicSettings,hasKey:!!key};
+    }
+    case 'AI_SAVE':{
+      const previous=(await chrome.storage.local.get(AI_STORE))[AI_STORE]||{},config=validateAIConfig(m.config);
+      const key=m.key===undefined?(previous.endpoint===config.endpoint?previous.key||'':''):String(m.key).trim();
+      if(config.endpoint&&!await chrome.permissions.contains({origins:[new URL(config.endpoint).origin+'/*']}))throw new Error('尚未允许访问此 AI 接口，请重新保存并完成浏览器授权。');
+      await chrome.storage.local.set({[AI_STORE]:{...config,key}});
+      state.ai={enabled:config.enabled,configured:!!config.endpoint,revision:crypto.randomUUID()};state.aiQueue=[];
+      for(const row of state.rows){
+        if(!config.enabled&&['queued','reading'].includes(row.aiStatus?.status))row.aiStatus={status:'stopped',note:'AI 已关闭，保留已有结果。'};
+        else if(config.enabled&&['complete','partial'].includes(row.status))queueAI(row);
+      }
+      await save();return state;
+    }
     case 'BATCH_FROM_HISTORY':{
       if(!state.history.some(b=>b.id===m.id))throw new Error('没有找到该批次。');
       const old=(await chrome.storage.local.get(batchKey(m.id)))[batchKey(m.id)];if(!old)throw new Error('没有找到该批次数据。');return newBatch(old);
@@ -630,15 +789,27 @@ async function dispatch(m,sender){
       state.notice=`已准备 ${rows.length} 位博主。`;await save();return state;
     }
     case 'COLUMNS':{
-      const known=new Set(FIELDS.map(x=>x.key));
-      if(m.columns.length!==FIELDS.length||new Set(m.columns.map(x=>x.key)).size!==FIELDS.length||m.columns.some(x=>!known.has(x.key)))throw new Error('列配置不完整。');
+      const known=new Set(FIELDS.map(x=>x.key)),required=fieldsFor(FIELDS,primary()).map(f=>f.key);
+      if(!Array.isArray(m.columns)||new Set(m.columns.map(x=>x.key)).size!==m.columns.length||m.columns.some(x=>!known.has(x.key))||required.some(k=>!m.columns.some(c=>c.key===k)))throw new Error('列配置不完整。');
       if(!m.columns.some(x=>x.visible))throw new Error('请至少保留一列。');
-      state.columns=m.columns.map(x=>({key:x.key,label:FIELDS.find(f=>f.key===x.key).label,visible:!!x.visible}));await save();return state;
+      state.columns=[...m.columns.map(x=>({key:x.key,label:FIELDS.find(f=>f.key===x.key).label,visible:!!x.visible})),...state.columns.filter(c=>!m.columns.some(x=>x.key===c.key))];await save();return state;
     }
     case 'EDIT':{
       const row=state.rows.find(r=>r.id===m.id);if(!row)throw new Error('未找到达人。');
       if(!FIELDS.some(x=>x.key===m.key))throw new Error('未知字段。');
-      const numeric=['followers','median','average','instagramFollowers','youtubeSubscribers'].includes(m.key),value=String(m.value??'').trim();
+      if(m.key==='url'||m.key.endsWith('Url')){
+        const platform=m.key==='url'?row.platform||primary():({tiktokUrl:'tiktok',instagramUrl:'instagram',youtubeUrl:'youtube'})[m.key];
+        const value=String(m.value??'').trim(),p=value?normalizeCreator(value,platform):null;
+        if(value&&!p)throw new Error('请输入对应平台的有效 HTTPS 主页链接，或留空。');
+        row.overrides[m.key]=p?.url||'';
+        if(m.key!=='url'){
+          const linkKey={tiktok:'tiktok',instagram:'instagram',youtube:'youtube'}[platform],countKey={tiktok:'tiktokFollowers',instagram:'instagramFollowers',youtube:'youtubeSubscribers'}[platform];
+          const nextLink=platform==='instagram'?p?.handle||'':p?.url||'';
+          if(row[linkKey]!==nextLink){row[linkKey]=nextLink;row[countKey]=null;delete row.overrides[countKey];}
+        }
+        row.result=resultFor(row,state.config,row.capturedAt);await save();return state;
+      }
+      const numeric=['followers','median','average','tiktokFollowers','instagramFollowers','youtubeSubscribers'].includes(m.key),value=String(m.value??'').trim();
       if(numeric&&value!==''&&(!Number.isFinite(Number(value))||Number(value)<0))throw new Error('数量请输入大于或等于 0 的数字，或留空。');
       row.overrides[m.key]=numeric&&value!==''?Number(value):String(m.value??'');
       row.result=resultFor(row,state.config,state.run.now||Date.now());await save();return state;
@@ -661,7 +832,7 @@ async function dispatch(m,sender){
       if(state.instagramPending?.rowId===row.id)state.instagramPending=null;
       const now=Date.now();state.flow='results';
       state.run={status:'idle',now,index:null,tabId:null,token:null,forceFresh:true,batchIds:[row.id],retryRowId:row.id};
-      Object.assign(row,{status:'queued',note:'正在原批次重新读取此达人。',capturedAt:now,videos:[],profile:{},preview:null,paging:null,direct:null,access:null,outcome:null,diagnostic:null,dataErrorAt:null,exhausted:false});
+      Object.assign(row,{status:'queued',note:'正在原批次重新读取此达人。',capturedAt:now,videos:[],profile:{},preview:null,paging:null,direct:null,reader:null,aiResult:null,aiStatus:null,access:null,outcome:null,diagnostic:null,dataErrorAt:null,exhausted:false});
       row.result=resultFor(row,state.config,now);await save();await start();return state;
     }
     case 'CLEAR':
@@ -678,7 +849,7 @@ async function dispatch(m,sender){
     }
     case 'START':{
       if(state.run.status==='running')return state;
-      const clean=m.rows?validateRows(m.rows):null;
+      const clean=m.rows?validateRows(m.rows,sourcePlatform(m.config||state.config)):null;
       if(clean&&!clean.length)throw new Error('请至少填写一位博主的主页。');
       if(m.config)normalizeStatsConfig(m.config);
       if(clean)await save();
@@ -704,6 +875,29 @@ async function dispatch(m,sender){
 }
 chrome.runtime.onMessage.addListener((m,sender,respond)=>{
   if(sender.id!==chrome.runtime.id)return;
+  if(['GITHUB_CHECK','GITHUB_STATUS','GITHUB_PREFS','GITHUB_INSTALL'].includes(m.type)){
+    (async()=>{
+      await ready;if(!sender.url?.startsWith(chrome.runtime.getURL('')))throw new Error('不接受网页发起的更新操作。');
+      if(m.type==='GITHUB_CHECK'){await githubUpdates.check(m.force===true);return githubUpdates.probe();}
+      if(m.type==='GITHUB_STATUS')return githubUpdates.read();
+      if(m.type==='GITHUB_PREFS')return githubUpdates.preferences(m.preferences);
+      if(state.run.status==='running')throw new Error('请先暂停采集，再安装更新。');
+      if(githubUpdates.installing)throw new Error('正在更新，请等待完成。');
+      await serialize(async()=>{if(state.run.status==='running')throw new Error('请先暂停采集。');await save();});
+      void githubUpdates.install({beforeCommit:()=>serialize(()=>save())}).catch(()=>{});return {started:true};
+    })().then(data=>respond({ok:true,data}),error=>respond({ok:false,error:error.message}));return true;
+  }
+  if(m.type==='AI_TEST'){
+    (async()=>{
+      await ready;if(!sender.url?.startsWith(chrome.runtime.getURL('')))throw new Error('不接受网页发起的设置操作。');
+      const settings=(await chrome.storage.local.get(AI_STORE))[AI_STORE];
+      if(!settings?.endpoint||!settings.model)throw new Error('请先保存接口地址和模型。');
+      if(!await chrome.permissions.contains({origins:[new URL(settings.endpoint).origin+'/*']}))throw new Error('AI 接口尚未授权。');
+      const testImage='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6cUgAAAAASUVORK5CYII=';
+      await requestAI(settings,settings.key,{bio:'',videos:[{id:'connection-test',text:'数码产品评测',hashtags:['tech']}]},{signal:AbortSignal.timeout(25000),images:settings.useImages?[{id:'connection-test',dataUrl:testImage}]:[]});
+      return {connected:true};
+    })().then(data=>respond({ok:true,data}),error=>respond({ok:false,error:error.name==='TimeoutError'?'AI 请求超时，请检查接口与模型。':error.message}));return true;
+  }
   serialize(()=>dispatch(m,sender)).then(data=>respond({ok:true,data}),error=>respond({ok:false,error:error.message}));return true;
 });
 let workbenchOpening;
@@ -734,12 +928,14 @@ chrome.action.onClicked.addListener(()=>{openWorkbench().catch(()=>{});});
 chrome.runtime.onInstalled.addListener(()=>{ready.then(openWorkbench).catch(()=>{});});
 ready.then(async()=>{
   for(const platform of Object.keys(ORIGINS))if(await allowed(platform))await register(platform);
+  await chrome.alarms.create('kol-github-updates',{periodInMinutes:CHECK_INTERVAL/60000});
+  void githubUpdates.check(false);
 }).catch(()=>{});
 chrome.tabs.onUpdated.addListener((tabId,change,tab)=>{
   if(!['loading','complete'].includes(change.status)&&!change.url)return;
   serialize(async()=>{
     await ready;
-    if(state.run.status==='running'&&state.run.mode!=='creator-api'&&state.run.tabId===tabId&&!state.run.retryAt){
+    if(state.run.status==='running'&&!['creator-api','multi-api'].includes(state.run.mode)&&state.run.tabId===tabId&&!state.run.retryAt){
       if(change.url&&state.run.owned===false&&normalizeProfile(change.url)?.handle.toLowerCase()!==activeRow()?.handle.toLowerCase()){await recover('原页面已切换，将在独立采集页继续');return;}
       if(change.status==='loading'){state.run.begunToken=null;state.run.token=crypto.randomUUID();state.run.phase='loading';state.run.lastReceived=Date.now();await save();}
       else await beginCurrent();
@@ -752,12 +948,13 @@ chrome.tabs.onRemoved.addListener(tabId=>{
   serialize(async()=>{await ready;if(state.run.status==='running'&&state.run.tabId===tabId){if(state.run.mode==='creator-api')scheduleDirect();else await recover('采集页已关闭，将自动重建');}}).catch(()=>{});
 });
 chrome.permissions.onRemoved.addListener(()=>{
-  serialize(async()=>{await ready;if(state.run.status==='running'&&!await allowed('tiktok'))await pause('TikTok 读取权限已被撤销，请重新授权后继续。','blocked');}).catch(()=>{});
+  serialize(async()=>{await ready;if(state.run.status==='running'&&!await allowed(primary()))await pause(`${PLATFORM_NAMES[primary()]} 读取权限已被撤销，请重新授权后继续。`,'blocked');}).catch(()=>{});
 });
 chrome.alarms.onAlarm.addListener(alarm=>{
+  if(alarm.name==='kol-github-updates'){void githubUpdates.check(false);return;}
   if(!['kol-watchdog','kol-recover'].includes(alarm.name))return;
-  serialize(async()=>{await ready;if(alarm.name==='kol-recover')await resumeRecovery();else {await heartbeat();if(state.instagramPending||state.instagramQueue.length)scheduleInstagram();if(state.youtubePending||state.youtubeQueue.length)scheduleYouTube();}}).catch(()=>{});
+  serialize(async()=>{await ready;if(alarm.name==='kol-recover')await resumeRecovery();else {await heartbeat();if(state.instagramPending||state.instagramQueue.length)scheduleInstagram();if(state.youtubePending||state.youtubeQueue.length)scheduleYouTube();if(state.aiQueue.length)scheduleAI();}}).catch(()=>{});
 });
 chrome.runtime.onStartup.addListener(()=>{
-  serialize(async()=>{await ready;if(state.run.status==='running'){state.run.retryAt=null;if(state.run.mode==='creator-api')scheduleDirect();else await recover('浏览器已恢复，正在重连上次任务');}}).catch(()=>{});
+  serialize(async()=>{await ready;if(state.run.status==='running'){state.run.retryAt=null;if(state.run.mode==='creator-api')scheduleDirect();else if(state.run.mode==='multi-api')scheduleMulti();else await recover('浏览器已恢复，正在重连上次任务');}}).catch(()=>{});
 });
