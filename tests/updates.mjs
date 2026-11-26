@@ -103,6 +103,8 @@ try{
   // Preserve the identity of a previous manually loaded (no key) installation.
   const legacy=path.join(work,'legacy'),legacyExt=path.join(legacy,'extension');await mkdir(legacyExt,{recursive:true});await writeFile(path.join(legacyExt,'manifest.json'),JSON.stringify({name:manifest.name,version:'0.1.4',manifest_version:3}));install(source,0,legacy);
   assert.equal(Object.hasOwn(JSON.parse(await readFile(path.join(legacyExt,'manifest.json'),'utf8')),'key'),false);
+  const legacyLoaded=await cdp.send('Extensions.loadUnpacked',{path:legacyExt});
+  const legacyHost=JSON.parse(await readFile(path.join(legacy,'updater-config.json'),'utf8'));assert.equal(legacyHost.origin,`chrome-extension://${legacyLoaded.id}/`);
   passed.push('迁移时沿用已有 key；无 key 的旧手动安装保持无 key，避免更新改变插件身份。');
   await writeFile(path.join(out,'updates-results.json'),JSON.stringify({browser:browser.product,passed,errors,note:'独立测试用户；使用测试数据，不代表真实平台完整采集验收。'},null,2));success=true;
   console.log(JSON.stringify({passed,errors,out},null,2));
